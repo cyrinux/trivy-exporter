@@ -293,6 +293,13 @@ func listenDockerEvents(scanQueue chan<- string, wg *sync.WaitGroup) {
 			if event.Type == events.ContainerEventType && event.Action == "start" {
 				container, err := cli.ContainerInspect(ctx, event.Actor.ID)
 				if err == nil {
+					// Check if the container has the label "trivy.scan" with value "false"
+					if scanLabel, exists := container.Config.Labels["trivy.scan"]; exists && scanLabel == "false" {
+						log.Printf("Skipping container %s as it has the label trivy.scan: false", container.Config.Image)
+						continue
+					}
+
+					// If the label is not "false" or the label doesn't exist, scan the container
 					log.Printf("Detected new container start: %s", container.Config.Image)
 					wg.Add(1)
 					scanQueue <- container.Config.Image
