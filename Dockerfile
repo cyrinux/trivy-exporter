@@ -1,0 +1,46 @@
+# Stage 1: Build the Go application
+FROM golang:1.24 AS builder
+
+# Set the Current Working Directory inside the container
+WORKDIR /app
+
+# Copy go mod and sum files
+COPY go.mod go.sum ./
+
+# Download all dependencies. Dependencies will be cached if the go.mod and go.sum files are not changed
+RUN go mod download
+
+# Copy the source code into the container
+COPY . .
+
+# Build the Go app
+RUN go build -o main .
+
+# Stage 2: Run the application
+FROM debian:bookworm-slim
+
+# Install Trivy CLI
+RUN apt-get update && apt-get install -y wget apt-transport-https gnupg lsb-release curl
+RUN wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | apt-key add - && \
+    echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | tee -a /etc/apt/sources.list.d/trivy.list && \
+    apt-get update && apt-get install -y trivy
+
+# Set the Current Working Directory inside the container
+WORKDIR /app
+
+# Copy the Pre-built binary file from the previous stage
+COPY --from=builder /app/main .
+
+# Set environment variables
+ENV RESULTS_DIR=/results
+ENV DOCKER_HOST=unix:///var/run/docker.sock
+ENV TRIVY_SERVER_URL=http://localhost:4954
+ENV NTFY_WEBHOOK_URL=
+ENV TRIVY_EXTRA_ARGS="--ignore-unfixed"
+ENV NUM_WORKERS=2
+
+# Expose port 8080 to the outside world
+EXPOSE 8080
+
+# Command to run the executable
+CMD ["./main"]
