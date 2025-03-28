@@ -6,6 +6,7 @@ require (
 	github.com/docker/docker v28.0.4+incompatible
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/prometheus/client_golang v1.21.1
+	github.com/sirupsen/logrus v1.9.3
 )
 
 require (

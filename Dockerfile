@@ -36,8 +36,10 @@ ENV RESULTS_DIR=/results
 ENV DOCKER_HOST=unix:///var/run/docker.sock
 ENV TRIVY_SERVER_URL=http://localhost:4954
 ENV NTFY_WEBHOOK_URL=
-ENV TRIVY_EXTRA_ARGS="--ignore-unfixed"
+ENV TRIVY_EXTRA_ARGS=--ignore-unfixed
+ENV SCAN_INTERVAL_MINUTES=15
 ENV NUM_WORKERS=2
+ENV LOG_LEVEL=info
 
 # Expose port 8080 to the outside world
 EXPOSE 8080

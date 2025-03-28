@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -15,40 +14,63 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/events"
+	dockerEvents "github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/client"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	log "github.com/sirupsen/logrus"
 )
 
-var (
-	resultsDir     = getEnv("RESULTS_DIR", "/results")
-	dockerHost     = getEnv("DOCKER_HOST", "unix:///var/run/docker.sock")
-	trivyServerURL = getEnv("TRIVY_SERVER_URL", "http://localhost:4954")
-	ntfyWebhookURL = getEnv("NTFY_WEBHOOK_URL", "https://ntfy.sh/vulns")
-	numWorkers     = getEnv("NUM_WORKERS", "2")
-	trivyExtraArgs = getEnv("TRIVY_EXTRA_ARGS", "") // Allow extra args for Trivy scans
+// RESULTS_DIR: Directory where Trivy JSON outputs are stored.
+var resultsDir = getEnv("RESULTS_DIR", "/results")
 
-	vulnMetric = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "trivy_vulnerability",
-			Help: "Detected vulnerabilities from Trivy reports",
-		},
-		[]string{"image", "image_name", "package", "package_version", "id", "severity", "status", "description"},
-	)
-	vulnTimestampMetric = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "trivy_vulnerability_timestamp",
-			Help: "Timestamp of the last detected vulnerability for each image",
-		},
-		[]string{"image", "vulnerability_id"},
-	)
-	db *sql.DB
+// DOCKER_HOST: Docker socket or address, e.g. unix:///var/run/docker.sock.
+var dockerHost = getEnv("DOCKER_HOST", "unix:///var/run/docker.sock")
 
-	lastMetricsUpdate time.Time // Track the last time metrics were updated
+// TRIVY_SERVER_URL: Endpoint for Trivy server.
+var trivyServerURL = getEnv("TRIVY_SERVER_URL", "http://localhost:4954")
+
+// NTFY_WEBHOOK_URL: ntfy.sh webhook for sending vulnerability alerts.
+var ntfyWebhookURL = getEnv("NTFY_WEBHOOK_URL", "https://ntfy.sh/vulns")
+
+// NUM_WORKERS: Number of goroutines that perform image scans.
+var numWorkers = getEnv("NUM_WORKERS", "2")
+
+// TRIVY_EXTRA_ARGS: Additional arguments passed to Trivy.
+var trivyExtraArgs = getEnv("TRIVY_EXTRA_ARGS", "")
+
+// SCAN_INTERVAL_MINUTES: Prevent rescanning an image within this interval.
+var scanIntervalStr = getEnv("SCAN_INTERVAL_MINUTES", "15")
+
+// Global SQLite database handle.
+var db *sql.DB
+
+// Prometheus metrics for vulnerabilities.
+var vulnMetric = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "trivy_vulnerability",
+		Help: "Detected vulnerabilities from Trivy reports",
+	},
+	[]string{"image", "image_name", "package", "package_version", "id", "severity", "status", "description"},
 )
 
+// Prometheus metrics tracking timestamps of vulnerabilities.
+var vulnTimestampMetric = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "trivy_vulnerability_timestamp",
+		Help: "Timestamp of the last detected vulnerability for each image",
+	},
+	[]string{"image", "vulnerability_id"},
+)
+
+// Rescan interval for images to avoid frequent re-scans.
+var scanInterval time.Duration
+
+// Timestamp of the last Prometheus metrics update.
+var lastMetricsUpdate time.Time
+
+// TrivyVulnerability models a single vulnerability from a Trivy JSON report.
 type TrivyVulnerability struct {
 	VulnerabilityID string `json:"VulnerabilityID"`
 	PkgName         string `json:"PkgName"`
@@ -57,6 +79,7 @@ type TrivyVulnerability struct {
 	Description     string `json:"Description"`
 }
 
+// TrivyReport represents the full JSON structure from Trivy.
 type TrivyReport struct {
 	ArtifactName string `json:"ArtifactName"`
 	Results      []struct {
@@ -64,275 +87,337 @@ type TrivyReport struct {
 	} `json:"Results"`
 }
 
-func getEnv(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
+// init function sets up logging, database, and scan interval.
+func init() {
+	// Configure log level based on LOG_LEVEL env variable (default "info").
+	logLevel := getEnv("LOG_LEVEL", "info")
+	lvl, err := log.ParseLevel(logLevel)
+	if err != nil {
+		lvl = log.InfoLevel
 	}
-	return defaultValue
+	log.SetLevel(lvl)
+	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
+
+	// Initialize the database (creates tables if needed).
+	initDatabase()
+
+	// Parse the scan interval (in minutes) for re-scan checks.
+	val, err := strconv.Atoi(scanIntervalStr)
+	if err != nil || val < 1 {
+		val = 30
+		log.Warnf("Invalid SCAN_INTERVAL_MINUTES, defaulting to 30 minutes")
+	}
+	scanInterval = time.Duration(val) * time.Minute
 }
 
-func worker(scanQueue <-chan string, wg *sync.WaitGroup) {
-	for image := range scanQueue {
-		if err := requestTrivyScan(image, trivyServerURL); err != nil {
-			log.Printf("Trivy scan error for %s: %v", image, err)
+// getEnv fetches an environment variable or returns a provided default.
+func getEnv(key, defaultVal string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
+	}
+	return defaultVal
+}
+
+// initDatabase opens the SQLite database and creates necessary tables.
+func initDatabase() {
+	var err error
+	db, err = sql.Open("sqlite3", resultsDir+"/vulns.db")
+	if err != nil {
+		log.Fatalf("Failed opening DB: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS vulnerabilities (
+			vulnerability_id TEXT PRIMARY KEY,
+			image TEXT,
+			image_name TEXT,
+			package TEXT,
+			package_version TEXT,
+			severity TEXT,
+			status TEXT,
+			description TEXT,
+			timestamp TEXT
+		)`)
+	if err != nil {
+		log.Fatalf("Failed creating vulnerabilities table: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS scans (
+			image TEXT PRIMARY KEY,
+			last_scan_time INTEGER
+		)`)
+	if err != nil {
+		log.Fatalf("Failed creating scans table: %v", err)
+	}
+}
+
+// getLastScanTime retrieves the last time we scanned a specific image.
+func getLastScanTime(image string) (time.Time, bool) {
+	var t int64
+	err := db.QueryRow(`SELECT last_scan_time FROM scans WHERE image = ?`, image).Scan(&t)
+	if err != nil {
+		log.Debugf("No previous scan time found for %s", image)
+		return time.Time{}, false
+	}
+	return time.Unix(t, 0), true
+}
+
+// updateLastScanTime sets the current time for a scanned image in the database.
+func updateLastScanTime(image string) {
+	_, _ = db.Exec(`INSERT OR REPLACE INTO scans (image, last_scan_time) VALUES (?, ?)`,
+		image, time.Now().Unix())
+}
+
+// requestTrivyScan calls Trivy on the provided image, storing the JSON report to disk.
+func requestTrivyScan(image, server string) error {
+	log.Debugf("Scanning image: %s", image)
+	parts := strings.Split(image, ":")
+	baseName := parts[0]
+	tag := "latest"
+	if len(parts) > 1 {
+		tag = parts[1]
+	}
+	outFile := fmt.Sprintf("%s/%s_%s.json", resultsDir, strings.ReplaceAll(baseName, "/", "_"), tag)
+
+	args := []string{"image", "--server", server, "--scanners", "vuln", "--format", "json", "--output", outFile}
+	if trivyExtraArgs != "" {
+		args = append(args, strings.Split(trivyExtraArgs, " ")...)
+	}
+	args = append(args, image)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "trivy", args...)
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("Trivy scan timeout for %s", image)
 		}
-		wg.Done()
+		return fmt.Errorf("Error running Trivy scan: %w", err)
 	}
+
+	// Update the DB so we know the last scan time for this image.
+	updateLastScanTime(image)
+	return nil
 }
 
-func sendAlert(image, pkg, cveID, severity, description string) {
-	if ntfyWebhookURL == "" {
-		log.Println("No ntfy.sh webhook URL provided, skipping alert")
+// parseTrivyReport reads a JSON file from Trivy and saves vulnerabilities.
+func parseTrivyReport(filePath string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Debugf("Error reading file %s: %v", filePath, err)
 		return
 	}
 
-	message := fmt.Sprintf(`
-Image: %s
-Package: %s, CVE ID: %s
-Description: %s`,
-		image, pkg, cveID, description,
-	)
-	req, err := http.NewRequest("POST", ntfyWebhookURL, strings.NewReader(message))
+	var rep TrivyReport
+	if err := json.Unmarshal(data, &rep); err != nil {
+		log.Debugf("Error unmarshaling %s: %v", filePath, err)
+		return
+	}
+
+	saveVulnerabilitiesToDatabase(rep)
+	os.Remove(filePath)
+	log.Debugf("Processed and removed %s", filePath)
+}
+
+// walkJsonDirectory finds any .json files in the results directory and processes them.
+func walkJsonDirectory() {
+	files, err := os.ReadDir(resultsDir)
 	if err != nil {
-		log.Printf("Error creating request: %v", err)
+		log.Debugf("Error reading directory: %v", err)
+		return
+	}
+	for _, f := range files {
+		if filepath.Ext(f.Name()) == ".json" {
+			parseTrivyReport(filepath.Join(resultsDir, f.Name()))
+		}
+	}
+}
+
+// saveVulnerabilitiesToDatabase persists new vulnerabilities to the DB and alerts.
+func saveVulnerabilitiesToDatabase(report TrivyReport) {
+	imageName := strings.Split(report.ArtifactName, ":")[0]
+	for _, res := range report.Results {
+		for _, vuln := range res.Vulnerabilities {
+			row := db.QueryRow(`SELECT vulnerability_id FROM vulnerabilities WHERE vulnerability_id = ?`, vuln.VulnerabilityID)
+			var existingID string
+			if err := row.Scan(&existingID); err != nil && err != sql.ErrNoRows {
+				continue
+			}
+			if existingID == "" {
+				sendAlert(report.ArtifactName, vuln.PkgName, vuln.VulnerabilityID, vuln.Severity, vuln.Description)
+				_, _ = db.Exec(`
+					INSERT OR IGNORE INTO vulnerabilities (
+						vulnerability_id, image, image_name, package, package_version, 
+						severity, status, description, timestamp
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`,
+					vuln.VulnerabilityID,
+					report.ArtifactName,
+					imageName,
+					vuln.PkgName,
+					vuln.PkgVersion,
+					vuln.Severity,
+					"NEW",
+					vuln.Description,
+					time.Now().Format(time.RFC3339),
+				)
+				log.Debugf("New vulnerability recorded: %s", vuln.VulnerabilityID)
+			}
+		}
+	}
+}
+
+// sendAlert sends a notification about a vulnerability to ntfy.sh (if configured).
+func sendAlert(image, pkg, cveID, severity, description string) {
+	if ntfyWebhookURL == "" {
+		log.Debug("ntfyWebhookURL not set, skipping alert")
+		return
+	}
+
+	log.Debugf("Sending alert for CVE: %s on image: %s", cveID, image)
+	msg := fmt.Sprintf(`Image: %s
+Package: %s, CVE ID: %s
+Description: %s`, image, pkg, cveID, description)
+
+	req, err := http.NewRequest("POST", ntfyWebhookURL, strings.NewReader(msg))
+	if err != nil {
+		log.Debugf("Error creating request: %v", err)
 		return
 	}
 	req.Header.Set("Title", fmt.Sprintf("New %s vulnerability found", severity))
 	req.Header.Set("Priority", "urgent")
 	req.Header.Set("Tags", fmt.Sprintf("warning,security,%s", strings.ToLower(severity)))
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("Error sending alert: %v", err)
+		log.Debugf("Error sending alert: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("ntfy.sh returned status: %d", resp.StatusCode)
-	}
+	log.Debugf("Alert sent for CVE: %s with status: %s", cveID, resp.Status)
 }
 
-func initDatabase() {
-	var err error
-	db, err = sql.Open("sqlite3", resultsDir+"/vulns.db")
-	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
-	}
-
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS vulnerabilities (
-        vulnerability_id TEXT PRIMARY KEY,
-        image TEXT,
-        image_name TEXT,
-        package TEXT,
-        package_version TEXT,
-        severity TEXT,
-        status TEXT,
-        description TEXT,
-        timestamp TEXT
-    )`)
-	if err != nil {
-		log.Fatalf("Failed to create table: %v", err)
-	}
-}
-
-func requestTrivyScan(image, server string) error {
-	// Split the image into its base name and tag
-	parts := strings.Split(image, ":")
-	baseImageName := parts[0] // e.g., "alpine"
-	tag := "latest"
-	if len(parts) > 1 {
-		tag = parts[1] // Get the tag if available, otherwise use "latest"
-	}
-
-	// Construct the filename using both the base image name and the tag to avoid overwriting
-	outputFile := fmt.Sprintf("%s/%s_%s.json", resultsDir, strings.ReplaceAll(baseImageName, "/", "_"), tag)
-	cmdArgs := []string{"image", "--server", server, "--scanners", "vuln", "--format", "json", "--output", outputFile}
-
-	// Add extra arguments before the image name
-	if trivyExtraArgs != "" {
-		log.Printf("Adding extra arguments to Trivy scan: %s", trivyExtraArgs)
-		cmdArgs = append(cmdArgs, strings.Split(trivyExtraArgs, " ")...)
-	}
-
-	// Finally, append the image name (last argument)
-	cmdArgs = append(cmdArgs, image)
-
-	log.Printf("Running Trivy scan with command: trivy %s", strings.Join(cmdArgs, " "))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "trivy", cmdArgs...)
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("trivy scan timeout for %s", image)
-		}
-		return fmt.Errorf("error running Trivy scan: %w", err)
-	}
-	return nil
-}
-
-func saveVulnerabilitiesToDatabase(report TrivyReport) {
-	// Extract base image name (without tag) for storing in the DB
-	imageName := strings.Split(report.ArtifactName, ":")[0]
-
-	for _, result := range report.Results {
-		for _, vuln := range result.Vulnerabilities {
-			// Check if the vulnerability already exists in the DB
-			row := db.QueryRow(`SELECT 1 FROM vulnerabilities WHERE vulnerability_id = ?`, vuln.VulnerabilityID)
-			var exists int
-			if err := row.Scan(&exists); err != nil && err != sql.ErrNoRows {
-				log.Printf("Error checking vulnerability in DB: %v", err)
-				continue
-			}
-
-			// If this vulnerability is not in the DB, insert it
-			if exists == 0 {
-				sendAlert(report.ArtifactName, vuln.PkgName, vuln.VulnerabilityID, vuln.Severity, vuln.Description)
-				_, err := db.Exec(`INSERT OR IGNORE INTO vulnerabilities 
-                                    (vulnerability_id, image, image_name, package, package_version, 
-                                    severity, status, description, timestamp) 
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					vuln.VulnerabilityID, report.ArtifactName, imageName, vuln.PkgName, vuln.PkgVersion,
-					vuln.Severity, "NEW", vuln.Description, time.Now().Format(time.RFC3339))
-				if err != nil {
-					log.Printf("Error inserting vulnerability into DB: %v", err)
-				}
-			}
-		}
-	}
-}
-
-func parseTrivyReport(filePath string) {
-	// Read the Trivy JSON report from the file
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		log.Printf("Error reading file %s: %v", filePath, err)
-		return
-	}
-
-	var report TrivyReport
-	if err := json.Unmarshal(data, &report); err != nil {
-		log.Printf("Error parsing JSON %s: %v", filePath, err)
-		return
-	}
-
-	// Save the vulnerabilities to the database
-	saveVulnerabilitiesToDatabase(report)
-
-	// Optionally, remove the JSON file after processing it
-	os.Remove(filePath)
-}
-
-func walkJsonDirectory() {
-	files, err := os.ReadDir(resultsDir)
-	if err != nil {
-		log.Printf("Error reading directory: %v", err)
-		return
-	}
-
-	for _, file := range files {
-		if filepath.Ext(file.Name()) == ".json" {
-			parseTrivyReport(filepath.Join(resultsDir, file.Name()))
-		}
-	}
-}
-
+// updateMetricsFromDatabase refreshes all Prometheus metrics from the DB.
 func updateMetricsFromDatabase() {
-	// Reset Prometheus metrics to avoid duplicates or outdated data
+	log.Debug("Updating Prometheus metrics")
+
 	vulnMetric.Reset()
 	vulnTimestampMetric.Reset()
 
-	// Query the database for vulnerabilities
-	rows, err := db.Query(`SELECT image, image_name, package, package_version, vulnerability_id, severity, status, description, timestamp FROM vulnerabilities`)
+	rows, err := db.Query(`
+		SELECT image, image_name, package, package_version, 
+		       vulnerability_id, severity, status, description, timestamp
+		FROM vulnerabilities
+	`)
 	if err != nil {
-		log.Printf("Error querying database: %v", err)
+		log.Debugf("Error querying DB: %v", err)
 		return
 	}
 	defer rows.Close()
 
-	// Iterate over all rows and set them in the Prometheus metrics
 	for rows.Next() {
-		var image, imageName, pkg, pkgVersion, vulnID, severity, status, description, timestamp string
-		if err := rows.Scan(&image, &imageName, &pkg, &pkgVersion, &vulnID, &severity, &status, &description, &timestamp); err != nil {
-			log.Printf("Error scanning row: %v", err)
+		var (
+			image, imageName, pkg, pkgVersion, vulnID, sev, status, desc, ts string
+		)
+		if err := rows.Scan(&image, &imageName, &pkg, &pkgVersion, &vulnID, &sev, &status, &desc, &ts); err != nil {
 			continue
 		}
-
-		// Update the metrics for the vulnerability
-		vulnMetric.WithLabelValues(image, imageName, pkg, pkgVersion, vulnID, severity, status, description).Set(1)
+		vulnMetric.WithLabelValues(image, imageName, pkg, pkgVersion, vulnID, sev, status, desc).Set(1)
 		vulnTimestampMetric.WithLabelValues(image, vulnID).Set(float64(time.Now().Unix()))
 	}
 
-	// Update the last metrics update timestamp
 	lastMetricsUpdate = time.Now()
+	log.Debug("Metrics updated successfully")
 }
 
+// handleMetrics is the HTTP handler for serving /metrics to Prometheus.
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
-	// Serve the Prometheus metrics
+	log.Debug("Serving /metrics")
 	promhttp.Handler().ServeHTTP(w, r)
 }
 
+// listenDockerEvents listens to Docker container events to trigger scans upon container startup.
 func listenDockerEvents(scanQueue chan<- string, wg *sync.WaitGroup) {
+	log.Debug("Starting Docker event listener")
+
 	opts := []client.Opt{client.WithAPIVersionNegotiation()}
 	if dockerHost != "unix:///var/run/docker.sock" {
 		opts = append(opts, client.WithHost(dockerHost))
 	}
-
 	cli, err := client.NewClientWithOpts(opts...)
 	if err != nil {
 		log.Fatalf("Error creating Docker client: %v", err)
 	}
 
 	ctx := context.Background()
-	eventChan, errChan := cli.Events(ctx, events.ListOptions{})
+	evtCh, errCh := cli.Events(ctx, dockerEvents.ListOptions{})
 	for {
 		select {
-		case event := <-eventChan:
-			if event.Type == events.ContainerEventType && event.Action == "start" {
-				container, err := cli.ContainerInspect(ctx, event.Actor.ID)
+		case evt := <-evtCh:
+			if evt.Type == dockerEvents.ContainerEventType && evt.Action == "start" {
+				ctr, err := cli.ContainerInspect(ctx, evt.Actor.ID)
 				if err == nil {
-					// Check if the container has the label "trivy.scan" with value "false"
-					if scanLabel, exists := container.Config.Labels["trivy.scan"]; exists && scanLabel == "false" {
-						log.Printf("Skipping container %s as it has the label trivy.scan: false", container.Config.Image)
+					if label, ok := ctr.Config.Labels["trivy.scan"]; ok && label == "false" {
+						log.Debug("Skipping container with trivy.scan=false label")
 						continue
 					}
-
-					// If the label is not "false" or the label doesn't exist, scan the container
-					log.Printf("Detected new container start: %s", container.Config.Image)
+					lastScan, found := getLastScanTime(ctr.Config.Image)
+					if found && time.Since(lastScan) < scanInterval {
+						log.Debugf("Skipping recent scan for %s (within %v)", ctr.Config.Image, scanInterval)
+						continue
+					}
 					wg.Add(1)
-					scanQueue <- container.Config.Image
+					select {
+					case scanQueue <- ctr.Config.Image:
+						log.Debugf("Queued image: %s for scanning", ctr.Config.Image)
+					case <-time.After(5 * time.Second):
+						log.Debugf("Scan queue blocked, skipping %s", ctr.Config.Image)
+					}
+				} else {
+					log.Debugf("Container inspect error: %v", err)
 				}
 			}
-		case err := <-errChan:
-			log.Printf("Docker event error: %v", err)
+		case e := <-errCh:
+			if e != nil {
+				log.Debugf("Docker event error: %v", e)
+				time.Sleep(5 * time.Second)
+			}
 		}
 	}
 }
 
-func main() {
-	// Initialize the SQLite database
-	initDatabase()
+// worker continuously processes images from the scan queue by calling requestTrivyScan.
+func worker(scanQueue <-chan string, wg *sync.WaitGroup) {
+	for image := range scanQueue {
+		log.Debugf("Worker scanning %s", image)
+		if err := requestTrivyScan(image, trivyServerURL); err != nil {
+			log.Warnf("Trivy scan error for %s: %v", image, err)
+		}
+		wg.Done()
+	}
+}
 
+// main sets up workers, event listeners, and the HTTP server for metrics.
+func main() {
 	defer db.Close()
 
-	prometheus.MustRegister(vulnMetric)
-	prometheus.MustRegister(vulnTimestampMetric)
+	prometheus.MustRegister(vulnMetric, vulnTimestampMetric)
 
-	numWorkersInt, err := strconv.Atoi(numWorkers)
-	if err != nil || numWorkersInt < 2 {
-		log.Println("Invalid NUM_WORKERS value or too low, defaulting to 2")
-		numWorkersInt = 2
+	n, err := strconv.Atoi(numWorkers)
+	if err != nil || n < 2 {
+		n = 2
 	}
+	log.Infof("Starting with %d worker(s), scan interval set to %v", n, scanInterval)
 
-	scanQueue := make(chan string, numWorkersInt)
+	scanQ := make(chan string, n)
 	var wg sync.WaitGroup
 
-	for i := 0; i < numWorkersInt; i++ {
-		go worker(scanQueue, &wg)
+	// Spin up worker goroutines.
+	for i := 0; i < n; i++ {
+		go worker(scanQ, &wg)
 	}
 
+	// Periodically walk the results directory to parse leftover JSON reports.
 	go func() {
 		for {
 			walkJsonDirectory()
@@ -340,6 +425,7 @@ func main() {
 		}
 	}()
 
+	// Periodically update Prometheus metrics from the DB.
 	go func() {
 		for {
 			updateMetricsFromDatabase()
@@ -347,13 +433,12 @@ func main() {
 		}
 	}()
 
-	go listenDockerEvents(scanQueue, &wg)
+	// Start listening to Docker events to detect new containers.
+	go listenDockerEvents(scanQ, &wg)
 
-	// Setup HTTP server to expose metrics endpoint
+	// Provide /metrics endpoint for Prometheus scrapes.
 	http.HandleFunc("/metrics", handleMetrics)
 
-	// Print the server info and start listening on port 8080
-	log.Printf("Server listening on :8080/metrics, storing results in %s, using Docker host %s, Trivy server at %s",
-		resultsDir, dockerHost, trivyServerURL)
+	log.Infof("Listening on :8080/metrics, results in %s", resultsDir)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
