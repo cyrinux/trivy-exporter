@@ -1,3 +1,4 @@
+// trivy-exporter
 package main
 
 import (
@@ -16,61 +17,55 @@ import (
 
 	dockerEvents "github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/client"
+	"github.com/fsnotify/fsnotify"
+	otelpyroscope "github.com/grafana/otel-profiling-go"
+	"github.com/grafana/pyroscope-go"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
-// RESULTS_DIR: Directory where Trivy JSON outputs are stored.
-var resultsDir = getEnv("RESULTS_DIR", "/results")
+// Environment variables
+var (
+	resultsDir        = getEnv("RESULTS_DIR", "/results")
+	dockerHost        = getEnv("DOCKER_HOST", "unix:///var/run/docker.sock")
+	trivyServerURL    = getEnv("TRIVY_SERVER_URL", "http://localhost:4954")
+	ntfyWebhookURL    = getEnv("NTFY_WEBHOOK_URL", "https://ntfy.sh/vulns")
+	tempoEndpoint     = getEnv("TEMPO_ENDPOINT", "localhost:4317")
+	pyroscopeEndpoint = getEnv("PYROSCOPE_ENDPOINT", "localhost:4040")
+	numWorkers        = getEnv("NUM_WORKERS", "2")
+	trivyExtraArgs    = getEnv("TRIVY_EXTRA_ARGS", "")
+	db                *sql.DB
 
-// DOCKER_HOST: Docker socket or address, e.g. unix:///var/run/docker.sock.
-var dockerHost = getEnv("DOCKER_HOST", "unix:///var/run/docker.sock")
-
-// TRIVY_SERVER_URL: Endpoint for Trivy server.
-var trivyServerURL = getEnv("TRIVY_SERVER_URL", "http://localhost:4954")
-
-// NTFY_WEBHOOK_URL: ntfy.sh webhook for sending vulnerability alerts.
-var ntfyWebhookURL = getEnv("NTFY_WEBHOOK_URL", "https://ntfy.sh/vulns")
-
-// NUM_WORKERS: Number of goroutines that perform image scans.
-var numWorkers = getEnv("NUM_WORKERS", "2")
-
-// TRIVY_EXTRA_ARGS: Additional arguments passed to Trivy.
-var trivyExtraArgs = getEnv("TRIVY_EXTRA_ARGS", "")
-
-// SCAN_INTERVAL_MINUTES: Prevent rescanning an image within this interval.
-var scanIntervalStr = getEnv("SCAN_INTERVAL_MINUTES", "15")
-
-// Global SQLite database handle.
-var db *sql.DB
-
-// Prometheus metrics for vulnerabilities.
-var vulnMetric = prometheus.NewGaugeVec(
-	prometheus.GaugeOpts{
-		Name: "trivy_vulnerability",
-		Help: "Detected vulnerabilities from Trivy reports",
-	},
-	[]string{"image", "image_name", "package", "package_version", "id", "severity", "status", "description"},
+	// Prometheus metrics
+	vulnMetric = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "trivy_vulnerability",
+			Help: "Detected vulnerabilities from Trivy reports",
+		},
+		[]string{"image", "image_name", "package", "package_version", "id", "severity", "status", "description"},
+	)
+	vulnTimestampMetric = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "trivy_vulnerability_timestamp",
+			Help: "Timestamp of the last detected vulnerability for each image",
+		},
+		[]string{"image", "vulnerability_id"},
+	)
+	alertChannel     = make(chan Alert, 100) // Buffer size for pending alerts
+	alertsInProgress sync.Map                // Track CVEs being processed to avoid duplicates
 )
 
-// Prometheus metrics tracking timestamps of vulnerabilities.
-var vulnTimestampMetric = prometheus.NewGaugeVec(
-	prometheus.GaugeOpts{
-		Name: "trivy_vulnerability_timestamp",
-		Help: "Timestamp of the last detected vulnerability for each image",
-	},
-	[]string{"image", "vulnerability_id"},
-)
-
-// Rescan interval for images to avoid frequent re-scans.
-var scanInterval time.Duration
-
-// Timestamp of the last Prometheus metrics update.
-var lastMetricsUpdate time.Time
-
-// TrivyVulnerability models a single vulnerability from a Trivy JSON report.
+// TrivyVulnerability represents a single vulnerability from the Trivy JSON report
 type TrivyVulnerability struct {
 	VulnerabilityID string `json:"VulnerabilityID"`
 	PkgName         string `json:"PkgName"`
@@ -79,7 +74,7 @@ type TrivyVulnerability struct {
 	Description     string `json:"Description"`
 }
 
-// TrivyReport represents the full JSON structure from Trivy.
+// TrivyReport captures the full structure of a Trivy scan report
 type TrivyReport struct {
 	ArtifactName string `json:"ArtifactName"`
 	Results      []struct {
@@ -87,9 +82,52 @@ type TrivyReport struct {
 	} `json:"Results"`
 }
 
-// init function sets up logging, database, and scan interval.
+// imageScanItem holds both the image to scan and the scanners param
+type imageScanItem struct {
+	Image    string
+	Scanners string
+}
+
+// Alert represents a vulnerability notification
+type Alert struct {
+	Image       string
+	Package     string
+	CVEID       string
+	Severity    string
+	Description string
+}
+
+func initTracer() trace.TracerProvider {
+	exp, _ := otlptrace.New(context.Background(), otlptracegrpc.NewClient(
+		otlptracegrpc.WithEndpoint(tempoEndpoint),
+		otlptracegrpc.WithInsecure(),
+	))
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName("trivy-exporter"),
+		)),
+	)
+
+	return tp
+}
+
+// init runs before main(), setting up logging and DB
 func init() {
-	// Configure log level based on LOG_LEVEL env variable (default "info").
+	ctx := context.Background()
+
+	// Initialize your tracer provider as usual.
+	tp := initTracer()
+
+	// Wrap it with otelpyroscope tracer provider.
+	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tp))
+
+	// If you're using Pyroscope Go SDK, initialize pyroscope profiler.
+	_, _ = pyroscope.Start(pyroscope.Config{
+		ApplicationName: "trivy-exporter",
+		ServerAddress:   pyroscopeEndpoint,
+	})
 	logLevel := getEnv("LOG_LEVEL", "info")
 	lvl, err := log.ParseLevel(logLevel)
 	if err != nil {
@@ -98,32 +136,107 @@ func init() {
 	log.SetLevel(lvl)
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
 
-	// Initialize the database (creates tables if needed).
-	initDatabase()
-
-	// Parse the scan interval (in minutes) for re-scan checks.
-	val, err := strconv.Atoi(scanIntervalStr)
-	if err != nil || val < 1 {
-		val = 30
-		log.Warnf("Invalid SCAN_INTERVAL_MINUTES, defaulting to 30 minutes")
-	}
-	scanInterval = time.Duration(val) * time.Minute
+	initDatabase(ctx)
 }
 
-// getEnv fetches an environment variable or returns a provided default.
-func getEnv(key, defaultVal string) string {
-	if val, ok := os.LookupEnv(key); ok {
-		return val
-	}
-	return defaultVal
+// HealthResponse is the healthcheck structure
+type HealthResponse struct {
+	Status    string `json:"status"`
+	Message   string `json:"message"`
+	CheckedAt string `json:"checked_at"`
 }
 
-// initDatabase opens the SQLite database and creates necessary tables.
-func initDatabase() {
-	var err error
-	db, err = sql.Open("sqlite3", resultsDir+"/vulns.db")
+func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
+	// Create the health check response struct
+	response := HealthResponse{
+		Status:    "ok",
+		Message:   "Service is healthy",
+		CheckedAt: time.Now().Format(time.RFC3339),
+	}
+
+	// Set the response content type as JSON
+	w.Header().Set("Content-Type", "application/json")
+
+	// Return status code 200 (OK)
+	w.WriteHeader(http.StatusOK)
+
+	// Encode the response as JSON and write it to the response body
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		// Handle encoding error
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
+
+// main starts the program, spawning watchers, listeners, and the HTTP server
+func main() {
+	defer db.Close()
+
+	ctx := context.Background()
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "MainSpan")
+	defer span.End()
+
+	n, err := strconv.Atoi(numWorkers)
+	if err != nil || n < 2 {
+		n = 2
+	}
+	log.Infof("Starting with %d worker(s). Using fsnotify to track JSON files in %s", n, resultsDir)
+
+	// Register Prometheus metrics
+	prometheus.MustRegister(vulnMetric, vulnTimestampMetric)
+
+	opts := []client.Opt{client.WithAPIVersionNegotiation()}
+	if dockerHost != "unix:///var/run/docker.sock" {
+		opts = append(opts, client.WithHost(dockerHost))
+	}
+	cli, err := client.NewClientWithOpts(opts...)
 	if err != nil {
-		log.Fatalf("Failed opening DB: %v", err)
+		log.Fatalf("Error creating Docker client: %v", err)
+	}
+
+	// Channel of imageScanItem structs for scans
+	scanQ := make(chan imageScanItem, n)
+	var wg sync.WaitGroup
+
+	// Spawn worker goroutines
+	for i := 0; i < n; i++ {
+		go worker(ctx, cli, scanQ, &wg)
+	}
+
+	// Watch the resultsDir for new JSON files using fsnotify
+	go watchResultsDirectory(ctx)
+
+	// Refresh metrics every 30s
+	go func() {
+		for {
+			updateMetricsFromDatabase(ctx)
+			time.Sleep(30 * time.Second)
+		}
+	}()
+
+	// Listen for Docker container "start" events, queueing scans
+	go listenDockerEvents(ctx, cli, scanQ, &wg)
+
+	// Start the alert batch processor
+	go processAlertBatches(ctx)
+
+	// Provide /metrics for Prometheus
+	http.Handle("/metrics", otelhttp.NewHandler(http.HandlerFunc(handleMetrics), "Metrics"))
+	// Add the health check endpoint
+	http.Handle("/health", otelhttp.NewHandler(http.HandlerFunc(handleHealthCheck), "HealthCheck"))
+
+	log.Infof("Listening on :8080, results stored in %s", resultsDir)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+// initDatabase opens or creates the DB and ensures we have required tables
+func initDatabase(ctx context.Context) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "InitDatabase")
+	defer span.End()
+
+	var err error
+	db, err = sql.Open("sqlite3", filepath.Join(resultsDir, "vulns.db"))
+	if err != nil {
+		log.Fatalf("Failed to open DB: %v", err)
 	}
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS vulnerabilities (
@@ -136,40 +249,187 @@ func initDatabase() {
 			status TEXT,
 			description TEXT,
 			timestamp TEXT
-		)`)
+		)
+	`)
 	if err != nil {
-		log.Fatalf("Failed creating vulnerabilities table: %v", err)
+		log.Fatalf("Failed to create vulnerabilities table: %v", err)
 	}
 	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS scans (
-			image TEXT PRIMARY KEY,
-			last_scan_time INTEGER
-		)`)
+	    CREATE TABLE IF NOT EXISTS image_scans (
+	        image TEXT PRIMARY KEY,
+	        checksum TEXT,
+	        status TEXT,
+	        timestamp INTEGER
+	    )
+	`)
 	if err != nil {
-		log.Fatalf("Failed creating scans table: %v", err)
+		log.Fatalf("Failed to create image_scans table: %v", err)
 	}
 }
 
-// getLastScanTime retrieves the last time we scanned a specific image.
-func getLastScanTime(image string) (time.Time, bool) {
-	var t int64
-	err := db.QueryRow(`SELECT last_scan_time FROM scans WHERE image = ?`, image).Scan(&t)
-	if err != nil {
-		log.Debugf("No previous scan time found for %s", image)
-		return time.Time{}, false
+// listenDockerEvents monitors Docker events. If container starts, we queue a scan with
+// user-specified scanners from the "trivy.scanners" label or default "vuln"
+// listenDockerEvents monitors Docker events. If container starts, we queue a scan with
+// user-specified scanners from the "trivy.scanners" label or default "vuln"
+func listenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<- imageScanItem, wg *sync.WaitGroup) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ListenDockerEvents")
+	defer span.End()
+
+	evCh, errCh := cli.Events(ctx, dockerEvents.ListOptions{})
+
+	for {
+		select {
+		case evt := <-evCh:
+			if evt.Type == dockerEvents.ContainerEventType && evt.Action == "start" {
+				info, e2 := cli.ContainerInspect(ctx, evt.Actor.ID)
+				if e2 != nil {
+					log.Debugf("Error inspecting container %s: %v", evt.Actor.ID, e2)
+					continue
+				}
+				// Check if label "trivy.scan" is false, skip
+				if skip, ok := info.Config.Labels["trivy.scan"]; ok && skip == "false" {
+					log.Debugf("Skipping container with trivy.scan=false: %s", info.Config.Image)
+					continue
+				}
+				// If label "trivy.scanners" is set, use that, otherwise default to "vuln"
+				scanners := "vuln"
+				if custom, ok := info.Config.Labels["trivy.scanners"]; ok && strings.TrimSpace(custom) != "" {
+					scanners = custom
+					log.Debugf("Using custom scanners '%s' for %s", scanners, info.Config.Image)
+				}
+				wg.Add(1)
+
+				// Use blocking send instead of select+default
+				log.Debugf("Queueing %s for scanning (scanners: %s) - will wait if queue is full", info.Config.Image, scanners)
+				scanQueue <- imageScanItem{Image: info.Config.Image, Scanners: scanners}
+				log.Debugf("Successfully queued %s for scanning", info.Config.Image)
+			}
+		case e := <-errCh:
+			if e != nil {
+				log.Debugf("Docker event error: %v", e)
+			}
+		}
 	}
-	return time.Unix(t, 0), true
 }
 
-// updateLastScanTime sets the current time for a scanned image in the database.
-func updateLastScanTime(image string) {
-	_, _ = db.Exec(`INSERT OR REPLACE INTO scans (image, last_scan_time) VALUES (?, ?)`,
-		image, time.Now().Unix())
+// worker processes queued images, calling Trivy with the specified scanners
+func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanItem, wg *sync.WaitGroup) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Worker")
+	defer span.End()
+
+	for item := range scanQueue {
+		checksum := getImageDigest(ctx, cli, item.Image)
+
+		// First check if already scanned (or in progress)
+		if alreadyScanned(ctx, item.Image, checksum) {
+			log.Infof("Skipping already scanned or in-progress image: %s", item.Image)
+			wg.Done()
+			continue
+		}
+
+		// Mark as in-progress immediately, before starting the scan
+		markImageScanInProgress(ctx, item.Image)
+
+		if err := requestTrivyScan(ctx, item.Image, trivyServerURL, item.Scanners); err != nil {
+			log.Warnf("Trivy scan error for %s: %v", item.Image, err)
+		} else {
+			saveImageChecksum(ctx, item.Image, checksum)
+		}
+		wg.Done()
+	}
 }
 
-// requestTrivyScan calls Trivy on the provided image, storing the JSON report to disk.
-func requestTrivyScan(image, server string) error {
-	log.Debugf("Scanning image: %s", image)
+func getImageDigest(ctx context.Context, cli *client.Client, image string) string {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "GetImageDigest")
+	defer span.End()
+
+	imgInspect, err := cli.ImageInspect(ctx, image)
+	if err != nil {
+		log.Warnf("Failed inspecting image %s: %v", image, err)
+		return ""
+	}
+
+	return imgInspect.ID
+}
+
+func alreadyScanned(ctx context.Context, image, checksum string) bool {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "AlreadyScanned")
+	defer span.End()
+
+	var dbChecksum, status string
+	err := db.QueryRow("SELECT checksum, status FROM image_scans WHERE image = ?", image).Scan(&dbChecksum, &status)
+
+	// If we find the image in the database and either:
+	// 1. It's the same checksum and status is "completed" or
+	// 2. Status is "in_progress" (regardless of checksum)
+	// then we consider it already scanned or being scanned
+	return err == nil && (dbChecksum == checksum && status == "completed" || status == "in_progress")
+}
+
+func markImageScanInProgress(ctx context.Context, image string) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "MarkImageScanInProgress")
+	defer span.End()
+
+	_, err := db.Exec(`
+        INSERT OR REPLACE INTO image_scans (image, status, timestamp)
+        VALUES (?, ?, ?)`,
+		image, "in_progress", time.Now().Unix(),
+	)
+	if err != nil {
+		log.Warnf("Failed marking scan as in-progress for %s: %v", image, err)
+	}
+}
+
+func saveImageChecksum(ctx context.Context, image, checksum string) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SaveImageChecksum")
+	defer span.End()
+
+	_, err := db.Exec(`
+        INSERT OR REPLACE INTO image_scans (image, checksum, status, timestamp)
+        VALUES (?, ?, ?, ?)`,
+		image, checksum, "completed", time.Now().Unix(),
+	)
+	if err != nil {
+		log.Warnf("Failed saving checksum for %s: %v", image, err)
+	}
+}
+
+// watchResultsDirectory uses fsnotify to detect .json file creation or writes in resultsDir
+func watchResultsDirectory(ctx context.Context) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "WatchResultsDirectory")
+	defer span.End()
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalf("Error creating fsnotify watcher: %v", err)
+	}
+	defer watcher.Close()
+
+	err = watcher.Add(resultsDir)
+	if err != nil {
+		log.Fatalf("Error watching %s: %v", resultsDir, err)
+	}
+	log.Debugf("Watching directory: %s", resultsDir)
+
+	for {
+		select {
+		case event := <-watcher.Events:
+			if event.Op&fsnotify.Create != 0 && filepath.Ext(event.Name) == ".json" {
+				go parseTrivyReport(ctx, event.Name)
+			}
+		case werr := <-watcher.Errors:
+			if werr != nil {
+				log.Warnf("Fsnotify error: %v", werr)
+			}
+		}
+	}
+}
+
+// requestTrivyScan runs Trivy with a specified set of scanners
+func requestTrivyScan(ctx context.Context, image, server, scanners string) error {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "RequestTrivyScan")
+	defer span.End()
+
 	parts := strings.Split(image, ":")
 	baseName := parts[0]
 	tag := "latest"
@@ -177,140 +437,76 @@ func requestTrivyScan(image, server string) error {
 		tag = parts[1]
 	}
 	outFile := fmt.Sprintf("%s/%s_%s.json", resultsDir, strings.ReplaceAll(baseName, "/", "_"), tag)
+	tmpOutFile := outFile + ".tmp"
 
-	args := []string{"image", "--server", server, "--scanners", "vuln", "--format", "json", "--output", outFile}
+	args := []string{
+		"image",
+		"--server", server,
+		"--scanners", scanners,
+		"--format", "json",
+		"--output", tmpOutFile,
+	}
 	if trivyExtraArgs != "" {
 		args = append(args, strings.Split(trivyExtraArgs, " ")...)
 	}
 	args = append(args, image)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "trivy", args...)
+	cmd := exec.Command("trivy", args...)
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("Trivy scan timeout for %s", image)
-		}
-		return fmt.Errorf("Error running Trivy scan: %w", err)
+		return fmt.Errorf("Trivy scan error for %s: %w", image, err)
 	}
-
-	// Update the DB so we know the last scan time for this image.
-	updateLastScanTime(image)
+	if err := os.Rename(tmpOutFile, outFile); err != nil {
+		return fmt.Errorf("Error renaming output file: %w", err)
+	}
 	return nil
 }
 
-// parseTrivyReport reads a JSON file from Trivy and saves vulnerabilities.
-func parseTrivyReport(filePath string) {
+// parseTrivyReport reads the JSON file and saves vulnerabilities, then deletes the file
+func parseTrivyReport(ctx context.Context, filePath string) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ParseTrivyReport")
+	defer span.End()
+
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		log.Debugf("Error reading file %s: %v", filePath, err)
+		log.Debugf("Error reading %s: %v", filePath, err)
 		return
 	}
-
 	var rep TrivyReport
 	if err := json.Unmarshal(data, &rep); err != nil {
-		log.Debugf("Error unmarshaling %s: %v", filePath, err)
+		log.Debugf("Error unmarshaling JSON: %v", err)
 		return
 	}
-
-	saveVulnerabilitiesToDatabase(rep)
-	os.Remove(filePath)
-	log.Debugf("Processed and removed %s", filePath)
-}
-
-// walkJsonDirectory finds any .json files in the results directory and processes them.
-func walkJsonDirectory() {
-	files, err := os.ReadDir(resultsDir)
-	if err != nil {
-		log.Debugf("Error reading directory: %v", err)
-		return
-	}
-	for _, f := range files {
-		if filepath.Ext(f.Name()) == ".json" {
-			parseTrivyReport(filepath.Join(resultsDir, f.Name()))
-		}
+	saveVulnerabilitiesToDatabase(ctx, rep)
+	if err := os.Remove(filePath); err != nil {
+		log.Debugf("Error removing %s: %v", filePath, err)
+	} else {
+		log.Debugf("Parsed and removed %s", filePath)
 	}
 }
 
-// saveVulnerabilitiesToDatabase persists new vulnerabilities to the DB and alerts.
-func saveVulnerabilitiesToDatabase(report TrivyReport) {
-	imageName := strings.Split(report.ArtifactName, ":")[0]
-	for _, res := range report.Results {
-		for _, vuln := range res.Vulnerabilities {
-			row := db.QueryRow(`SELECT vulnerability_id FROM vulnerabilities WHERE vulnerability_id = ?`, vuln.VulnerabilityID)
-			var existingID string
-			if err := row.Scan(&existingID); err != nil && err != sql.ErrNoRows {
-				continue
-			}
-			if existingID == "" {
-				sendAlert(report.ArtifactName, vuln.PkgName, vuln.VulnerabilityID, vuln.Severity, vuln.Description)
-				_, _ = db.Exec(`
-					INSERT OR IGNORE INTO vulnerabilities (
-						vulnerability_id, image, image_name, package, package_version, 
-						severity, status, description, timestamp
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-				`,
-					vuln.VulnerabilityID,
-					report.ArtifactName,
-					imageName,
-					vuln.PkgName,
-					vuln.PkgVersion,
-					vuln.Severity,
-					"NEW",
-					vuln.Description,
-					time.Now().Format(time.RFC3339),
-				)
-				log.Debugf("New vulnerability recorded: %s", vuln.VulnerabilityID)
-			}
-		}
-	}
-}
-
-// sendAlert sends a notification about a vulnerability to ntfy.sh (if configured).
-func sendAlert(image, pkg, cveID, severity, description string) {
-	if ntfyWebhookURL == "" {
-		log.Debug("ntfyWebhookURL not set, skipping alert")
-		return
-	}
-
-	log.Debugf("Sending alert for CVE: %s on image: %s", cveID, image)
-	msg := fmt.Sprintf(`Image: %s
-Package: %s, CVE ID: %s
-Description: %s`, image, pkg, cveID, description)
-
-	req, err := http.NewRequest("POST", ntfyWebhookURL, strings.NewReader(msg))
-	if err != nil {
-		log.Debugf("Error creating request: %v", err)
-		return
-	}
-	req.Header.Set("Title", fmt.Sprintf("New %s vulnerability found", severity))
-	req.Header.Set("Priority", "urgent")
-	req.Header.Set("Tags", fmt.Sprintf("warning,security,%s", strings.ToLower(severity)))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Debugf("Error sending alert: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	log.Debugf("Alert sent for CVE: %s with status: %s", cveID, resp.Status)
-}
-
-// updateMetricsFromDatabase refreshes all Prometheus metrics from the DB.
-func updateMetricsFromDatabase() {
-	log.Debug("Updating Prometheus metrics")
+// updateMetricsFromDatabase reads DB vulnerabilities and updates Prometheus metrics
+func updateMetricsFromDatabase(ctx context.Context) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "UpdateMetricsFromDatabase")
+	defer span.End()
 
 	vulnMetric.Reset()
 	vulnTimestampMetric.Reset()
 
 	rows, err := db.Query(`
-		SELECT image, image_name, package, package_version, 
-		       vulnerability_id, severity, status, description, timestamp
+		SELECT 
+			image,
+			image_name,
+			package,
+			package_version,
+			vulnerability_id,
+			severity,
+			status,
+			description,
+			timestamp
 		FROM vulnerabilities
 	`)
 	if err != nil {
-		log.Debugf("Error querying DB: %v", err)
+		log.Warnf("Error querying DB: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -325,120 +521,204 @@ func updateMetricsFromDatabase() {
 		vulnMetric.WithLabelValues(image, imageName, pkg, pkgVersion, vulnID, sev, status, desc).Set(1)
 		vulnTimestampMetric.WithLabelValues(image, vulnID).Set(float64(time.Now().Unix()))
 	}
-
-	lastMetricsUpdate = time.Now()
-	log.Debug("Metrics updated successfully")
 }
 
-// handleMetrics is the HTTP handler for serving /metrics to Prometheus.
+// handleMetrics is the handler for /metrics
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	log.Debug("Serving /metrics")
 	promhttp.Handler().ServeHTTP(w, r)
 }
 
-// listenDockerEvents listens to Docker container events to trigger scans upon container startup.
-func listenDockerEvents(scanQueue chan<- string, wg *sync.WaitGroup) {
-	log.Debug("Starting Docker event listener")
-
-	opts := []client.Opt{client.WithAPIVersionNegotiation()}
-	if dockerHost != "unix:///var/run/docker.sock" {
-		opts = append(opts, client.WithHost(dockerHost))
+// getEnv reads an environment variable or returns the default
+func getEnv(key, def string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
 	}
-	cli, err := client.NewClientWithOpts(opts...)
-	if err != nil {
-		log.Fatalf("Error creating Docker client: %v", err)
+	return def
+}
+
+// queueAlert adds an alert to the processing queue if it's not already being processed
+func queueAlert(ctx context.Context, image, pkg, cveID, severity, description string) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "QueueAlert")
+	defer span.End()
+
+	// Check if this CVE is already being processed
+	_, exists := alertsInProgress.LoadOrStore(cveID+":"+image, true)
+	if exists {
+		log.Debugf("Alert for CVE: %s on image: %s already queued, skipping", cveID, image)
+		return
 	}
 
-	ctx := context.Background()
-	evtCh, errCh := cli.Events(ctx, dockerEvents.ListOptions{})
+	// Queue the alert
+	select {
+	case alertChannel <- Alert{
+		Image:       image,
+		Package:     pkg,
+		CVEID:       cveID,
+		Severity:    severity,
+		Description: description,
+	}:
+		log.Debugf("Queued alert for CVE: %s on image: %s", cveID, image)
+	default:
+		log.Warnf("Alert queue full, dropping alert for CVE: %s on image: %s", cveID, image)
+		alertsInProgress.Delete(cveID + ":" + image)
+	}
+}
+
+// processAlertBatches continuously processes alerts in batches
+func processAlertBatches(ctx context.Context) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ProcessBatchAlertes")
+	defer span.End()
+
 	for {
-		select {
-		case evt := <-evtCh:
-			if evt.Type == dockerEvents.ContainerEventType && evt.Action == "start" {
-				ctr, err := cli.ContainerInspect(ctx, evt.Actor.ID)
-				if err == nil {
-					if label, ok := ctr.Config.Labels["trivy.scan"]; ok && label == "false" {
-						log.Debug("Skipping container with trivy.scan=false label")
-						continue
-					}
-					lastScan, found := getLastScanTime(ctr.Config.Image)
-					if found && time.Since(lastScan) < scanInterval {
-						log.Debugf("Skipping recent scan for %s (within %v)", ctr.Config.Image, scanInterval)
-						continue
-					}
-					wg.Add(1)
-					select {
-					case scanQueue <- ctr.Config.Image:
-						log.Debugf("Queued image: %s for scanning", ctr.Config.Image)
-					case <-time.After(5 * time.Second):
-						log.Debugf("Scan queue blocked, skipping %s", ctr.Config.Image)
-					}
-				} else {
-					log.Debugf("Container inspect error: %v", err)
-				}
+		// Collect a batch of at most 5 alerts
+		var batch []Alert
+		batchSize := 0
+		batchComplete := false
+
+		// Try to collect up to 5 alerts or until there are no more alerts for 100ms
+		for batchSize < 5 && !batchComplete {
+			select {
+			case alert := <-alertChannel:
+				batch = append(batch, alert)
+				batchSize++
+			case <-time.After(100 * time.Millisecond):
+				batchComplete = true
 			}
-		case e := <-errCh:
-			if e != nil {
-				log.Debugf("Docker event error: %v", e)
-				time.Sleep(5 * time.Second)
+		}
+
+		// If we have any alerts, send them
+		if len(batch) > 0 {
+			sendAlertBatch(ctx, batch)
+
+			// Clean up the tracking map
+			for _, alert := range batch {
+				alertsInProgress.Delete(alert.CVEID + ":" + alert.Image)
 			}
+
+			// Wait 10 seconds before processing the next batch
+			time.Sleep(10 * time.Second)
+		} else {
+			// If we didn't get any alerts, wait a bit to avoid busy-waiting
+			time.Sleep(1 * time.Second)
 		}
 	}
 }
 
-// worker continuously processes images from the scan queue by calling requestTrivyScan.
-func worker(scanQueue <-chan string, wg *sync.WaitGroup) {
-	for image := range scanQueue {
-		log.Debugf("Worker scanning %s", image)
-		if err := requestTrivyScan(image, trivyServerURL); err != nil {
-			log.Warnf("Trivy scan error for %s: %v", image, err)
-		}
-		wg.Done()
+// sendAlertBatch sends a batch of alerts as a single notification
+func sendAlertBatch(ctx context.Context, alerts []Alert) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SendAlertBatch")
+	defer span.End()
+
+	if ntfyWebhookURL == "" || len(alerts) == 0 {
+		return
 	}
+
+	log.Infof("Sending batch of %d alerts", len(alerts))
+
+	// Build the message body with all vulnerabilities
+	var msgBuilder strings.Builder
+	highestSeverity := "low"
+	severityOrder := map[string]int{
+		"unknown":  0,
+		"low":      1,
+		"medium":   2,
+		"high":     3,
+		"critical": 4,
+	}
+
+	for i, alert := range alerts {
+		// Track highest severity for title and priority
+		alertSev := strings.ToLower(alert.Severity)
+		if severityOrder[alertSev] > severityOrder[highestSeverity] {
+			highestSeverity = alertSev
+		}
+
+		// Add alert details to message
+		fmt.Fprintf(&msgBuilder, "Alert %d/%d:\n", i+1, len(alerts))
+		fmt.Fprintf(&msgBuilder, "Image: %s\n", alert.Image)
+		fmt.Fprintf(&msgBuilder, "Package: %s, CVE ID: %s\n", alert.Package, alert.CVEID)
+		fmt.Fprintf(&msgBuilder, "Severity: %s\n", alert.Severity)
+		fmt.Fprintf(&msgBuilder, "Description: %s\n\n", alert.Description)
+	}
+
+	// Create and send request
+	req, err := http.NewRequest("POST", ntfyWebhookURL, strings.NewReader(msgBuilder.String()))
+	if err != nil {
+		log.Warnf("Error creating batch alert request: %v", err)
+		return
+	}
+
+	title := fmt.Sprintf("%d New vulnerabilities found (highest: %s)", len(alerts), highestSeverity)
+	req.Header.Set("Title", title)
+
+	// Set priority based on highest severity
+	priority := "default"
+	if highestSeverity == "critical" || highestSeverity == "high" {
+		priority = "urgent"
+	} else if highestSeverity == "medium" {
+		priority = "high"
+	}
+	req.Header.Set("Priority", priority)
+	req.Header.Set("Tags", fmt.Sprintf("warning,security,batch,%s", highestSeverity))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Warnf("Error sending batch alert: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	log.Infof("Alert batch sent with status: %s", resp.Status)
 }
 
-// main sets up workers, event listeners, and the HTTP server for metrics.
-func main() {
-	defer db.Close()
+// sendAlert sends a notification about a vulnerability to ntfy.sh (if configured).
+func sendAlert(ctx context.Context, image, pkg, cveID, severity, description string) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SendAlert")
+	defer span.End()
 
-	prometheus.MustRegister(vulnMetric, vulnTimestampMetric)
-
-	n, err := strconv.Atoi(numWorkers)
-	if err != nil || n < 2 {
-		n = 2
-	}
-	log.Infof("Starting with %d worker(s), scan interval set to %v", n, scanInterval)
-
-	scanQ := make(chan string, n)
-	var wg sync.WaitGroup
-
-	// Spin up worker goroutines.
-	for i := 0; i < n; i++ {
-		go worker(scanQ, &wg)
+	if ntfyWebhookURL == "" {
+		log.Debug("ntfyWebhookURL not set, skipping alert")
+		return
 	}
 
-	// Periodically walk the results directory to parse leftover JSON reports.
-	go func() {
-		for {
-			walkJsonDirectory()
-			time.Sleep(30 * time.Second)
+	queueAlert(ctx, image, pkg, cveID, severity, description)
+}
+
+// saveVulnerabilitiesToDatabase inserts new vulnerabilities into the DB
+func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SaveVulnerabilitiesToDatabase")
+	defer span.End()
+
+	imageName := strings.Split(report.ArtifactName, ":")[0]
+	for _, res := range report.Results {
+		for _, vuln := range res.Vulnerabilities {
+			row := db.QueryRow(`SELECT vulnerability_id FROM vulnerabilities WHERE vulnerability_id = ? AND image = ?`, vuln.VulnerabilityID, report.ArtifactName)
+			var existingID string
+			if err := row.Scan(&existingID); err != nil && err != sql.ErrNoRows {
+				continue
+			}
+			if existingID == "" {
+				_, _ = db.Exec(`
+                    INSERT INTO vulnerabilities (
+                        vulnerability_id, image, image_name, package, package_version,
+                        severity, status, description, timestamp
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `,
+					vuln.VulnerabilityID,
+					report.ArtifactName,
+					imageName,
+					vuln.PkgName,
+					vuln.PkgVersion,
+					vuln.Severity,
+					"NEW",
+					vuln.Description,
+					time.Now().Format(time.RFC3339),
+				)
+				// Queue the alert instead of sending immediately
+				sendAlert(ctx, report.ArtifactName, vuln.PkgName, vuln.VulnerabilityID, vuln.Severity, vuln.Description)
+				log.Debugf("New vulnerability recorded and queued for alert: %s", vuln.VulnerabilityID)
+			}
 		}
-	}()
-
-	// Periodically update Prometheus metrics from the DB.
-	go func() {
-		for {
-			updateMetricsFromDatabase()
-			time.Sleep(30 * time.Second)
-		}
-	}()
-
-	// Start listening to Docker events to detect new containers.
-	go listenDockerEvents(scanQ, &wg)
-
-	// Provide /metrics endpoint for Prometheus scrapes.
-	http.HandleFunc("/metrics", handleMetrics)
-
-	log.Infof("Listening on :8080/metrics, results in %s", resultsDir)
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	}
 }
