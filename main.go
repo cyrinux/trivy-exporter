@@ -119,14 +119,6 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 
 // init runs before main(), setting up logging and DB
 func init() {
-	ctx := context.Background()
-
-	// Initialize your tracer provider as usual.
-	initTraceAndProfiler(ctx)
-
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Init")
-	defer span.End()
-
 	lvl, err := log.ParseLevel(logLevel)
 	if err != nil {
 		lvl = log.InfoLevel
@@ -134,32 +126,6 @@ func init() {
 	log.SetLevel(lvl)
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
 
-	initDatabase(ctx)
-}
-
-func initTraceAndProfiler(ctx context.Context) {
-	tp, err := initTracer(ctx)
-	if err != nil {
-		log.Fatalf("failed to initialize tracer: %v", err)
-	}
-	defer func() {
-		if err := tp.Shutdown(ctx); err != nil {
-			log.Errorf("Error shutting down tracer provider: %v", err)
-		}
-	}()
-
-	profiler, err := pyroscope.Start(pyroscope.Config{
-		ApplicationName: "trivy-exporter",
-		ServerAddress:   pyroscopeEndpoint,
-	})
-	if err != nil {
-		log.Fatalf("failed to start pyroscope profiler: %v", err)
-	}
-	defer func() {
-		if err := profiler.Stop(); err != nil {
-			log.Errorf("Error shutting down profiler provider: %v", err)
-		}
-	}()
 }
 
 // HealthResponse is the healthcheck structure
@@ -194,7 +160,31 @@ func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
 func main() {
 	ctx := context.Background()
 
+	initDatabase(ctx)
 	defer db.Close()
+
+	tp, err := initTracer(ctx)
+	if err != nil {
+		log.Fatalf("failed to initialize tracer: %v", err)
+	}
+	defer func() {
+		if err := tp.Shutdown(ctx); err != nil {
+			log.Errorf("Error shutting down tracer provider: %v", err)
+		}
+	}()
+
+	profiler, err := pyroscope.Start(pyroscope.Config{
+		ApplicationName: "trivy-exporter",
+		ServerAddress:   pyroscopeEndpoint,
+	})
+	if err != nil {
+		log.Fatalf("failed to start pyroscope profiler: %v", err)
+	}
+	defer func() {
+		if err := profiler.Stop(); err != nil {
+			log.Errorf("Error shutting down profiler provider: %v", err)
+		}
+	}()
 
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Main")
 	defer span.End()
