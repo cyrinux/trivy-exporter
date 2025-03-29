@@ -122,6 +122,22 @@ func init() {
 	ctx := context.Background()
 
 	// Initialize your tracer provider as usual.
+	initTraceAndProfiler(ctx)
+
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Init")
+	defer span.End()
+
+	lvl, err := log.ParseLevel(logLevel)
+	if err != nil {
+		lvl = log.InfoLevel
+	}
+	log.SetLevel(lvl)
+	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
+
+	initDatabase(ctx)
+}
+
+func initTraceAndProfiler(ctx context.Context) {
 	tp, err := initTracer(ctx)
 	if err != nil {
 		log.Fatalf("failed to initialize tracer: %v", err)
@@ -144,18 +160,6 @@ func init() {
 			log.Errorf("Error shutting down profiler provider: %v", err)
 		}
 	}()
-
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Init")
-	defer span.End()
-
-	lvl, err := log.ParseLevel(logLevel)
-	if err != nil {
-		lvl = log.InfoLevel
-	}
-	log.SetLevel(lvl)
-	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
-
-	initDatabase(ctx)
 }
 
 // HealthResponse is the healthcheck structure
