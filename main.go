@@ -454,7 +454,7 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string) error
 		tag = parts[1]
 	}
 	outFile := fmt.Sprintf("%s/%s_%s.json", resultsDir, strings.ReplaceAll(baseName, "/", "_"), tag)
-	tmpOutFile := outFile + ".tmp"
+	tmpOutFile := filepath.Join(os.TempDir(), filepath.Base(outFile)+".tmp")
 
 	args := []string{
 		"image",
