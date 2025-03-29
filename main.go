@@ -26,12 +26,10 @@ import (
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // Environment variables
@@ -46,7 +44,8 @@ var (
 	trivyExtraArgs    = getEnv("TRIVY_EXTRA_ARGS", "")
 	logLevel          = getEnv("LOG_LEVEL", "info")
 	db                *sql.DB
-
+	alertChannel      = make(chan Alert, 100) // Buffer size for pending alerts
+	alertsInProgress  sync.Map                // Track CVEs being processed to avoid duplicates
 	// Prometheus metrics
 	vulnMetric = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -62,8 +61,6 @@ var (
 		},
 		[]string{"image", "vulnerability_id"},
 	)
-	alertChannel     = make(chan Alert, 100) // Buffer size for pending alerts
-	alertsInProgress sync.Map                // Track CVEs being processed to avoid duplicates
 )
 
 // TrivyVulnerability represents a single vulnerability from the Trivy JSON report
@@ -98,20 +95,26 @@ type Alert struct {
 	Description string
 }
 
-func initTracer() trace.TracerProvider {
-	exp, _ := otlptrace.New(context.Background(), otlptracegrpc.NewClient(
+func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	exporter, err := otlptracegrpc.New(ctx,
 		otlptracegrpc.WithEndpoint(tempoEndpoint),
 		otlptracegrpc.WithInsecure(),
-	))
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exp),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tpr := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceName("trivy-exporter"),
+			semconv.ServiceVersion("1.0.0"),
 		)),
 	)
 
-	return tp
+	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tpr))
+	return tpr, nil
 }
 
 // init runs before main(), setting up logging and DB
@@ -119,16 +122,32 @@ func init() {
 	ctx := context.Background()
 
 	// Initialize your tracer provider as usual.
-	tp := initTracer()
+	tp, err := initTracer(ctx)
+	if err != nil {
+		log.Fatalf("failed to initialize tracer: %v", err)
+	}
+	defer func() {
+		if err := tp.Shutdown(ctx); err != nil {
+			log.Errorf("Error shutting down tracer provider: %v", err)
+		}
+	}()
 
-	// Wrap it with otelpyroscope tracer provider.
-	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tp))
-
-	// If you're using Pyroscope Go SDK, initialize pyroscope profiler.
-	_, _ = pyroscope.Start(pyroscope.Config{
+	profiler, err := pyroscope.Start(pyroscope.Config{
 		ApplicationName: "trivy-exporter",
 		ServerAddress:   pyroscopeEndpoint,
 	})
+	if err != nil {
+		log.Fatalf("failed to start pyroscope profiler: %v", err)
+	}
+	defer func() {
+		if err := profiler.Stop(); err != nil {
+			log.Errorf("Error shutting down profiler provider: %v", err)
+		}
+	}()
+
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "main")
+	defer span.End()
+
 	lvl, err := log.ParseLevel(logLevel)
 	if err != nil {
 		lvl = log.InfoLevel
