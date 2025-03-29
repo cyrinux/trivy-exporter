@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	dockerEvents "github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/fsnotify/fsnotify"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
@@ -26,12 +28,10 @@ import (
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // Environment variables
@@ -44,8 +44,10 @@ var (
 	pyroscopeEndpoint = getEnv("PYROSCOPE_ENDPOINT", "localhost:4040")
 	numWorkers        = getEnv("NUM_WORKERS", "2")
 	trivyExtraArgs    = getEnv("TRIVY_EXTRA_ARGS", "")
+	logLevel          = getEnv("LOG_LEVEL", "info")
 	db                *sql.DB
-
+	alertChannel      = make(chan Alert, 100) // Buffer size for pending alerts
+	alertsInProgress  sync.Map                // Track CVEs being processed to avoid duplicates
 	// Prometheus metrics
 	vulnMetric = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -61,8 +63,6 @@ var (
 		},
 		[]string{"image", "vulnerability_id"},
 	)
-	alertChannel     = make(chan Alert, 100) // Buffer size for pending alerts
-	alertsInProgress sync.Map                // Track CVEs being processed to avoid duplicates
 )
 
 // TrivyVulnerability represents a single vulnerability from the Trivy JSON report
@@ -97,38 +97,53 @@ type Alert struct {
 	Description string
 }
 
-func initTracer() trace.TracerProvider {
-	exp, _ := otlptrace.New(context.Background(), otlptracegrpc.NewClient(
+func moveFile(ctx context.Context, src, dst string) error {
+	_, span := otel.Tracer("trivy-exporter").Start(ctx, "MoveFile")
+	defer span.End()
+
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+
+	return os.Remove(src)
+}
+
+func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	exporter, err := otlptracegrpc.New(ctx,
 		otlptracegrpc.WithEndpoint(tempoEndpoint),
 		otlptracegrpc.WithInsecure(),
-	))
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exp),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tpr := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceName("trivy-exporter"),
+			semconv.ServiceVersion("1.2.0"),
 		)),
 	)
 
-	return tp
+	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tpr))
+	return tpr, nil
 }
 
 // init runs before main(), setting up logging and DB
 func init() {
-	ctx := context.Background()
-
-	// Initialize your tracer provider as usual.
-	tp := initTracer()
-
-	// Wrap it with otelpyroscope tracer provider.
-	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tp))
-
-	// If you're using Pyroscope Go SDK, initialize pyroscope profiler.
-	_, _ = pyroscope.Start(pyroscope.Config{
-		ApplicationName: "trivy-exporter",
-		ServerAddress:   pyroscopeEndpoint,
-	})
-	logLevel := getEnv("LOG_LEVEL", "info")
 	lvl, err := log.ParseLevel(logLevel)
 	if err != nil {
 		lvl = log.InfoLevel
@@ -136,7 +151,6 @@ func init() {
 	log.SetLevel(lvl)
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
 
-	initDatabase(ctx)
 }
 
 // HealthResponse is the healthcheck structure
@@ -169,10 +183,39 @@ func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
 
 // main starts the program, spawning watchers, listeners, and the HTTP server
 func main() {
+	ctx := context.Background()
+
+	initDatabase(ctx)
 	defer db.Close()
 
-	ctx := context.Background()
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "MainSpan")
+	tp, err := initTracer(ctx)
+	if err != nil {
+		log.Fatalf("failed to initialize tracer: %v", err)
+	}
+	defer func() {
+		if err := tp.Shutdown(ctx); err != nil {
+			log.Errorf("Error shutting down tracer provider: %v", err)
+		}
+	}()
+
+	profiler, err := pyroscope.Start(pyroscope.Config{
+		ApplicationName: "trivy-exporter",
+		ServerAddress:   pyroscopeEndpoint,
+		Tags: map[string]string{
+			"service_git_ref":    "main",
+			"service_repository": "https://github.com/cyrinux/trivy-exporter",
+		},
+	})
+	if err != nil {
+		log.Fatalf("failed to start pyroscope profiler: %v", err)
+	}
+	defer func() {
+		if err := profiler.Stop(); err != nil {
+			log.Errorf("Error shutting down profiler provider: %v", err)
+		}
+	}()
+
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Main")
 	defer span.End()
 
 	n, err := strconv.Atoi(numWorkers)
@@ -206,12 +249,7 @@ func main() {
 	go watchResultsDirectory(ctx)
 
 	// Refresh metrics every 30s
-	go func() {
-		for {
-			updateMetricsFromDatabase(ctx)
-			time.Sleep(30 * time.Second)
-		}
-	}()
+	go updateMetrics(ctx)
 
 	// Listen for Docker container "start" events, queueing scans
 	go listenDockerEvents(ctx, cli, scanQ, &wg)
@@ -228,6 +266,41 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+// updateMetrics call updateMetricsFromDatabase in loop
+func updateMetrics(ctx context.Context) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "UpdateMetrics")
+	defer span.End()
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	// Debounce-related variables
+	var debounceMu sync.Mutex
+	var lastExecuted time.Time
+	debounceInterval := 1 * time.Second
+
+	for {
+		select {
+		case <-ticker.C:
+			debounceMu.Lock()
+
+			// Only proceed if enough time has passed since the last execution
+			if time.Since(lastExecuted) >= debounceInterval {
+				lastExecuted = time.Now()
+				// Perform the action
+				updateMetricsFromDatabase(ctx)
+			} else {
+				log.Debug("Skipping updateMetrics call due to debounce")
+			}
+
+			debounceMu.Unlock()
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // initDatabase opens or creates the DB and ensures we have required tables
 func initDatabase(ctx context.Context) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "InitDatabase")
@@ -238,7 +311,7 @@ func initDatabase(ctx context.Context) {
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)
 	}
-	_, err = db.Exec(`
+	_, err = db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS vulnerabilities (
 			vulnerability_id TEXT PRIMARY KEY,
 			image TEXT,
@@ -254,7 +327,7 @@ func initDatabase(ctx context.Context) {
 	if err != nil {
 		log.Fatalf("Failed to create vulnerabilities table: %v", err)
 	}
-	_, err = db.Exec(`
+	_, err = db.ExecContext(ctx, `
 	    CREATE TABLE IF NOT EXISTS image_scans (
 	        image TEXT PRIMARY KEY,
 	        checksum TEXT,
@@ -264,6 +337,18 @@ func initDatabase(ctx context.Context) {
 	`)
 	if err != nil {
 		log.Fatalf("Failed to create image_scans table: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_vulns_image ON vulnerabilities (image)
+	`)
+	if err != nil {
+		log.Fatalf("Failed to create index on vulns table: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_image_scans_image ON image_scans (image)
+	`)
+	if err != nil {
+		log.Fatalf("Failed to create index on image_scans table: %v", err)
 	}
 }
 
@@ -275,12 +360,13 @@ func listenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ListenDockerEvents")
 	defer span.End()
 
-	evCh, errCh := cli.Events(ctx, dockerEvents.ListOptions{})
-
+	filterArgs := filters.NewArgs()
+	filterArgs.Add("event", "start")
+	evCh, errCh := cli.Events(ctx, dockerEvents.ListOptions{Filters: filterArgs})
 	for {
 		select {
 		case evt := <-evCh:
-			if evt.Type == dockerEvents.ContainerEventType && evt.Action == "start" {
+			if evt.Type == dockerEvents.ContainerEventType {
 				info, e2 := cli.ContainerInspect(ctx, evt.Actor.ID)
 				if e2 != nil {
 					log.Debugf("Error inspecting container %s: %v", evt.Actor.ID, e2)
@@ -353,11 +439,11 @@ func getImageDigest(ctx context.Context, cli *client.Client, image string) strin
 }
 
 func alreadyScanned(ctx context.Context, image, checksum string) bool {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "AlreadyScanned")
+	_, span := otel.Tracer("trivy-exporter").Start(ctx, "AlreadyScanned")
 	defer span.End()
 
 	var dbChecksum, status string
-	err := db.QueryRow("SELECT checksum, status FROM image_scans WHERE image = ?", image).Scan(&dbChecksum, &status)
+	err := db.QueryRowContext(ctx, "SELECT checksum, status FROM image_scans WHERE image = ?", image).Scan(&dbChecksum, &status)
 
 	// If we find the image in the database and either:
 	// 1. It's the same checksum and status is "completed" or
@@ -370,7 +456,7 @@ func markImageScanInProgress(ctx context.Context, image string) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "MarkImageScanInProgress")
 	defer span.End()
 
-	_, err := db.Exec(`
+	_, err := db.ExecContext(ctx, `
         INSERT OR REPLACE INTO image_scans (image, status, timestamp)
         VALUES (?, ?, ?)`,
 		image, "in_progress", time.Now().Unix(),
@@ -384,7 +470,7 @@ func saveImageChecksum(ctx context.Context, image, checksum string) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SaveImageChecksum")
 	defer span.End()
 
-	_, err := db.Exec(`
+	_, err := db.ExecContext(ctx, `
         INSERT OR REPLACE INTO image_scans (image, checksum, status, timestamp)
         VALUES (?, ?, ?, ?)`,
 		image, checksum, "completed", time.Now().Unix(),
@@ -396,7 +482,7 @@ func saveImageChecksum(ctx context.Context, image, checksum string) {
 
 // watchResultsDirectory uses fsnotify to detect .json file creation or writes in resultsDir
 func watchResultsDirectory(ctx context.Context) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "WatchResultsDirectory")
+	_, span := otel.Tracer("trivy-exporter").Start(ctx, "WatchResultsDirectory")
 	defer span.End()
 
 	watcher, err := fsnotify.NewWatcher()
@@ -405,21 +491,40 @@ func watchResultsDirectory(ctx context.Context) {
 	}
 	defer watcher.Close()
 
-	err = watcher.Add(resultsDir)
-	if err != nil {
+	if err := watcher.Add(resultsDir); err != nil {
 		log.Fatalf("Error watching %s: %v", resultsDir, err)
 	}
-	log.Debugf("Watching directory: %s", resultsDir)
+
+	debounceMu := sync.Mutex{}
+	debounced := map[string]time.Time{}
+	debounceDuration := 500 * time.Millisecond
+	timer := time.NewTimer(debounceDuration)
+	defer timer.Stop()
+
+	for range timer.C {
+		now := time.Now()
+		debounceMu.Lock()
+		for file, t := range debounced {
+			if now.Sub(t) >= debounceDuration {
+				go parseTrivyReport(ctx, file)
+				delete(debounced, file)
+			}
+		}
+		debounceMu.Unlock()
+		timer.Reset(debounceDuration)
+	}
 
 	for {
 		select {
 		case event := <-watcher.Events:
-			if event.Op&fsnotify.Create != 0 && filepath.Ext(event.Name) == ".json" {
-				go parseTrivyReport(ctx, event.Name)
+			if event.Op&(fsnotify.Create|fsnotify.Write) != 0 && filepath.Ext(event.Name) == ".json" {
+				debounceMu.Lock()
+				debounced[event.Name] = time.Now()
+				debounceMu.Unlock()
 			}
-		case werr := <-watcher.Errors:
-			if werr != nil {
-				log.Warnf("Fsnotify error: %v", werr)
+		case err := <-watcher.Errors:
+			if err != nil {
+				log.Warnf("Fsnotify error: %v", err)
 			}
 		}
 	}
@@ -437,7 +542,7 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string) error
 		tag = parts[1]
 	}
 	outFile := fmt.Sprintf("%s/%s_%s.json", resultsDir, strings.ReplaceAll(baseName, "/", "_"), tag)
-	tmpOutFile := outFile + ".tmp"
+	tmpOutFile := filepath.Join(os.TempDir(), filepath.Base(outFile)+".tmp")
 
 	args := []string{
 		"image",
@@ -451,20 +556,25 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string) error
 	}
 	args = append(args, image)
 
-	cmd := exec.Command("trivy", args...)
+	cmd := exec.CommandContext(ctx, "trivy", args...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("Trivy scan error for %s: %w", image, err)
 	}
-	if err := os.Rename(tmpOutFile, outFile); err != nil {
+	if err := moveFile(ctx, tmpOutFile, outFile); err != nil {
 		return fmt.Errorf("Error renaming output file: %w", err)
 	}
 	return nil
 }
 
 // parseTrivyReport reads the JSON file and saves vulnerabilities, then deletes the file
+var parseSem = make(chan struct{}, 5)
+
 func parseTrivyReport(ctx context.Context, filePath string) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ParseTrivyReport")
 	defer span.End()
+
+	parseSem <- struct{}{}
+	defer func() { <-parseSem }()
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -479,8 +589,6 @@ func parseTrivyReport(ctx context.Context, filePath string) {
 	saveVulnerabilitiesToDatabase(ctx, rep)
 	if err := os.Remove(filePath); err != nil {
 		log.Debugf("Error removing %s: %v", filePath, err)
-	} else {
-		log.Debugf("Parsed and removed %s", filePath)
 	}
 }
 
@@ -489,10 +597,12 @@ func updateMetricsFromDatabase(ctx context.Context) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "UpdateMetricsFromDatabase")
 	defer span.End()
 
+	log.Trace("Starting updateMetrics")
+
 	vulnMetric.Reset()
 	vulnTimestampMetric.Reset()
 
-	rows, err := db.Query(`
+	rows, err := db.QueryContext(ctx, `
 		SELECT 
 			image,
 			image_name,
@@ -539,7 +649,7 @@ func getEnv(key, def string) string {
 
 // queueAlert adds an alert to the processing queue if it's not already being processed
 func queueAlert(ctx context.Context, image, pkg, cveID, severity, description string) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "QueueAlert")
+	_, span := otel.Tracer("trivy-exporter").Start(ctx, "QueueAlert")
 	defer span.End()
 
 	// Check if this CVE is already being processed
@@ -643,7 +753,7 @@ func sendAlertBatch(ctx context.Context, alerts []Alert) {
 	}
 
 	// Create and send request
-	req, err := http.NewRequest("POST", ntfyWebhookURL, strings.NewReader(msgBuilder.String()))
+	req, err := http.NewRequestWithContext(ctx, "POST", ntfyWebhookURL, strings.NewReader(msgBuilder.String()))
 	if err != nil {
 		log.Warnf("Error creating batch alert request: %v", err)
 		return
@@ -693,7 +803,7 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
 	imageName := strings.Split(report.ArtifactName, ":")[0]
 	for _, res := range report.Results {
 		for _, vuln := range res.Vulnerabilities {
-			row := db.QueryRow(`SELECT vulnerability_id FROM vulnerabilities WHERE vulnerability_id = ? AND image = ?`, vuln.VulnerabilityID, report.ArtifactName)
+			row := db.QueryRowContext(ctx, `SELECT vulnerability_id FROM vulnerabilities WHERE vulnerability_id = ? AND image = ?`, vuln.VulnerabilityID, report.ArtifactName)
 			var existingID string
 			if err := row.Scan(&existingID); err != nil && err != sql.ErrNoRows {
 				continue

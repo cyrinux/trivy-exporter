@@ -14,7 +14,8 @@ RUN go mod download
 COPY . .
 
 # Build the Go app
-RUN go build -ldflags="-s -w" -o main .
+# RUN go build -ldflags="-s -w" -o main .
+RUN go build -ldflags=" -w" -o main .
 
 # Stage 2: Run the application
 FROM debian:bookworm-slim
