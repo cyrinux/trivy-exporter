@@ -109,7 +109,7 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceName("trivy-exporter"),
-			semconv.ServiceVersion("1.0.0"),
+			semconv.ServiceVersion("1.2.0"),
 		)),
 	)
 
