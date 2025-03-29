@@ -44,6 +44,7 @@ var (
 	pyroscopeEndpoint = getEnv("PYROSCOPE_ENDPOINT", "localhost:4040")
 	numWorkers        = getEnv("NUM_WORKERS", "2")
 	trivyExtraArgs    = getEnv("TRIVY_EXTRA_ARGS", "")
+	logLevel          = getEnv("LOG_LEVEL", "info")
 	db                *sql.DB
 
 	// Prometheus metrics
@@ -128,7 +129,6 @@ func init() {
 		ApplicationName: "trivy-exporter",
 		ServerAddress:   pyroscopeEndpoint,
 	})
-	logLevel := getEnv("LOG_LEVEL", "info")
 	lvl, err := log.ParseLevel(logLevel)
 	if err != nil {
 		lvl = log.InfoLevel
