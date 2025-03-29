@@ -145,7 +145,7 @@ func init() {
 		}
 	}()
 
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "main")
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Init")
 	defer span.End()
 
 	lvl, err := log.ParseLevel(logLevel)
@@ -188,10 +188,11 @@ func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
 
 // main starts the program, spawning watchers, listeners, and the HTTP server
 func main() {
+	ctx := context.Background()
+
 	defer db.Close()
 
-	ctx := context.Background()
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "MainSpan")
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Main")
 	defer span.End()
 
 	n, err := strconv.Atoi(numWorkers)
@@ -225,12 +226,7 @@ func main() {
 	go watchResultsDirectory(ctx)
 
 	// Refresh metrics every 30s
-	go func() {
-		for {
-			updateMetricsFromDatabase(ctx)
-			time.Sleep(30 * time.Second)
-		}
-	}()
+	go updateMetrics(ctx)
 
 	// Listen for Docker container "start" events, queueing scans
 	go listenDockerEvents(ctx, cli, scanQ, &wg)
@@ -247,9 +243,17 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+// updateMetrics call updateMetricsFromDatabase in loop
+func updateMetrics(ctx context.Context) {
+	for {
+		updateMetricsFromDatabase(ctx)
+		time.Sleep(30 * time.Second)
+	}
+}
+
 // initDatabase opens or creates the DB and ensures we have required tables
 func initDatabase(ctx context.Context) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "InitDatabase")
+	_, span := otel.Tracer("trivy-exporter").Start(ctx, "InitDatabase")
 	defer span.End()
 
 	var err error
@@ -372,7 +376,7 @@ func getImageDigest(ctx context.Context, cli *client.Client, image string) strin
 }
 
 func alreadyScanned(ctx context.Context, image, checksum string) bool {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "AlreadyScanned")
+	_, span := otel.Tracer("trivy-exporter").Start(ctx, "AlreadyScanned")
 	defer span.End()
 
 	var dbChecksum, status string
@@ -386,7 +390,7 @@ func alreadyScanned(ctx context.Context, image, checksum string) bool {
 }
 
 func markImageScanInProgress(ctx context.Context, image string) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "MarkImageScanInProgress")
+	_, span := otel.Tracer("trivy-exporter").Start(ctx, "MarkImageScanInProgress")
 	defer span.End()
 
 	_, err := db.Exec(`
@@ -400,7 +404,7 @@ func markImageScanInProgress(ctx context.Context, image string) {
 }
 
 func saveImageChecksum(ctx context.Context, image, checksum string) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SaveImageChecksum")
+	_, span := otel.Tracer("trivy-exporter").Start(ctx, "SaveImageChecksum")
 	defer span.End()
 
 	_, err := db.Exec(`
@@ -470,7 +474,7 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string) error
 	}
 	args = append(args, image)
 
-	cmd := exec.Command("trivy", args...)
+	cmd := exec.CommandContext(ctx, "trivy", args...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("Trivy scan error for %s: %w", image, err)
 	}
@@ -505,7 +509,7 @@ func parseTrivyReport(ctx context.Context, filePath string) {
 
 // updateMetricsFromDatabase reads DB vulnerabilities and updates Prometheus metrics
 func updateMetricsFromDatabase(ctx context.Context) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "UpdateMetricsFromDatabase")
+	_, span := otel.Tracer("trivy-exporter").Start(ctx, "UpdateMetricsFromDatabase")
 	defer span.End()
 
 	vulnMetric.Reset()
