@@ -245,7 +245,7 @@ func updateMetrics(ctx context.Context) {
 				// Perform the action
 				go updateMetricsFromDatabase(ctx)
 			} else {
-				log.Debug("Skipping updateMetrics call due to debounce")
+				log.Trace("Skipping updateMetrics call due to debounce")
 			}
 
 			debounceMu.Unlock()
@@ -363,7 +363,7 @@ func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanI
 
 		// First check if already scanned (or in progress)
 		if alreadyScanned(ctx, item.Image, checksum) {
-			log.Infof("Skipping already scanned or in-progress image: %s", item.Image)
+			log.Debugf("Skipping already scanned or in-progress image: %s", item.Image)
 			wg.Done()
 			continue
 		}
