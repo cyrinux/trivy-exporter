@@ -648,6 +648,7 @@ func processAlertBatches(ctx context.Context) {
 		for batchSize < 5 && !batchComplete {
 			select {
 			case alert := <-alertChannel:
+				log.Debugf("processAlertBatches %v", alert)
 				batch = append(batch, alert)
 				batchSize++
 			case <-time.After(100 * time.Millisecond):
