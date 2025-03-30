@@ -97,51 +97,6 @@ type Alert struct {
 	Description string
 }
 
-func moveFile(ctx context.Context, src, dst string) error {
-	_, span := otel.Tracer("trivy-exporter").Start(ctx, "MoveFile")
-	defer span.End()
-
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if _, err = io.Copy(out, in); err != nil {
-		return err
-	}
-
-	return os.Remove(src)
-}
-
-func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
-	exporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(tempoEndpoint),
-		otlptracegrpc.WithInsecure(),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	tpr := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("trivy-exporter"),
-			semconv.ServiceVersion("1.2.0"),
-		)),
-	)
-
-	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tpr))
-	return tpr, nil
-}
-
 // init runs before main(), setting up logging and DB
 func init() {
 	lvl, err := log.ParseLevel(logLevel)
@@ -271,13 +226,13 @@ func updateMetrics(ctx context.Context) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "UpdateMetrics")
 	defer span.End()
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	// Debounce-related variables
 	var debounceMu sync.Mutex
 	var lastExecuted time.Time
-	debounceInterval := 1 * time.Second
+	debounceInterval := 30 * time.Second
 
 	for {
 		select {
@@ -288,7 +243,7 @@ func updateMetrics(ctx context.Context) {
 			if time.Since(lastExecuted) >= debounceInterval {
 				lastExecuted = time.Now()
 				// Perform the action
-				updateMetricsFromDatabase(ctx)
+				go updateMetricsFromDatabase(ctx)
 			} else {
 				log.Debug("Skipping updateMetrics call due to debounce")
 			}
@@ -831,4 +786,49 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
 			}
 		}
 	}
+}
+
+func moveFile(ctx context.Context, src, dst string) error {
+	_, span := otel.Tracer("trivy-exporter").Start(ctx, "MoveFile")
+	defer span.End()
+
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+
+	return os.Remove(src)
+}
+
+func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	exporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint(tempoEndpoint),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tpr := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName("trivy-exporter"),
+			semconv.ServiceVersion("1.2.0"),
+		)),
+	)
+
+	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tpr))
+	return tpr, nil
 }
