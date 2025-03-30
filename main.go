@@ -98,6 +98,13 @@ type Alert struct {
 	Description string
 }
 
+// HealthResponse is the healthcheck structure
+type HealthResponse struct {
+	Status    string `json:"status"`
+	Message   string `json:"message"`
+	CheckedAt string `json:"checked_at"`
+}
+
 // init runs before main(), setting up logging and DB
 func init() {
 	lvl, err := log.ParseLevel(logLevel)
@@ -107,34 +114,6 @@ func init() {
 	log.SetLevel(lvl)
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
 
-}
-
-// HealthResponse is the healthcheck structure
-type HealthResponse struct {
-	Status    string `json:"status"`
-	Message   string `json:"message"`
-	CheckedAt string `json:"checked_at"`
-}
-
-func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
-	// Create the health check response struct
-	response := HealthResponse{
-		Status:    "ok",
-		Message:   "Service is healthy",
-		CheckedAt: time.Now().Format(time.RFC3339),
-	}
-
-	// Set the response content type as JSON
-	w.Header().Set("Content-Type", "application/json")
-
-	// Return status code 200 (OK)
-	w.WriteHeader(http.StatusOK)
-
-	// Encode the response as JSON and write it to the response body
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		// Handle encoding error
-		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
-	}
 }
 
 // main starts the program, spawning watchers, listeners, and the HTTP server
@@ -227,30 +206,18 @@ func updateMetrics(ctx context.Context) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "UpdateMetrics")
 	defer span.End()
 
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	// Debounce-related variables
-	var debounceMu sync.Mutex
-	var lastExecuted time.Time
-	debounceInterval := 30 * time.Second
+	// Initialize the debounced function with a 500ms delay
+	debounced := debounce.New(10 * time.Second)
 
 	for {
 		select {
 		case <-ticker.C:
-			debounceMu.Lock()
-
-			// Only proceed if enough time has passed since the last execution
-			if time.Since(lastExecuted) >= debounceInterval {
-				lastExecuted = time.Now()
-				// Perform the action
+			debounced(func() {
 				go updateMetricsFromDatabase(ctx)
-			} else {
-				log.Trace("Skipping updateMetrics call due to debounce")
-			}
-
-			debounceMu.Unlock()
-
+			})
 		case <-ctx.Done():
 			return
 		}
@@ -441,31 +408,25 @@ func watchResultsDirectory(ctx context.Context) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "WatchResultsDirectory")
 	defer span.End()
 
-	// Initialize the file watcher
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatalf("Error creating fsnotify watcher: %v", err)
 	}
 	defer watcher.Close()
 
-	// Add the directory to the watcher
 	err = watcher.Add(resultsDir)
 	if err != nil {
 		log.Fatalf("Error watching %s: %v", resultsDir, err)
 	}
 	log.Printf("Watching directory: %s", resultsDir)
 
-	// Initialize the debounced function with a 500ms delay
 	debounced := debounce.New(500 * time.Millisecond)
 
-	// Event handling loop
 	for {
 		select {
 		case event := <-watcher.Events:
-			// Process create events for .json files
 			if event.Op&fsnotify.Create != 0 && filepath.Ext(event.Name) == ".json" {
 				debounced(func() {
-					// Process the file (e.g., parseTrivyReport)
 					go parseTrivyReport(ctx, event.Name)
 				})
 			}
@@ -593,7 +554,6 @@ func getEnv(key, def string) string {
 
 // sendAlert adds an alert to the processing queue if it's not already being processed
 func sendAlert(ctx context.Context, image, pkg, cveID, severity, description string) {
-	log.Debug("DEBUG sendalert")
 	_, span := otel.Tracer("trivy-exporter").Start(ctx, "QueueAlert")
 	defer span.End()
 
@@ -622,7 +582,6 @@ func sendAlert(ctx context.Context, image, pkg, cveID, severity, description str
 
 // processAlertBatches continuously processes alerts in batches
 func processAlertBatches(ctx context.Context) {
-	log.Debug("DEBUG processAlertBatches")
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ProcessBatchAlertes")
 	defer span.End()
 
@@ -664,7 +623,6 @@ func processAlertBatches(ctx context.Context) {
 
 // sendAlertBatch sends a batch of alerts as a single notification
 func sendAlertBatch(ctx context.Context, alerts []Alert) {
-	log.Debug("DEBUG sendAlertBatch")
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SendAlertBatch")
 	defer span.End()
 
@@ -814,4 +772,25 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 
 	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tpr))
 	return tpr, nil
+}
+
+func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
+	// Create the health check response struct
+	response := HealthResponse{
+		Status:    "ok",
+		Message:   "Service is healthy",
+		CheckedAt: time.Now().Format(time.RFC3339),
+	}
+
+	// Set the response content type as JSON
+	w.Header().Set("Content-Type", "application/json")
+
+	// Return status code 200 (OK)
+	w.WriteHeader(http.StatusOK)
+
+	// Encode the response as JSON and write it to the response body
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		// Handle encoding error
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
 }
