@@ -42,7 +42,7 @@ var (
 	ntfyWebhookURL    = getEnv("NTFY_WEBHOOK_URL", "https://ntfy.sh/vulns")
 	tempoEndpoint     = getEnv("TEMPO_ENDPOINT", "localhost:4317")
 	pyroscopeEndpoint = getEnv("PYROSCOPE_ENDPOINT", "localhost:4040")
-	numWorkers        = getEnv("NUM_WORKERS", "2")
+	numWorkers        = getEnv("NUM_WORKERS", "1")
 	trivyExtraArgs    = getEnv("TRIVY_EXTRA_ARGS", "")
 	logLevel          = getEnv("LOG_LEVEL", "info")
 	db                *sql.DB
@@ -174,9 +174,9 @@ func main() {
 	defer span.End()
 
 	n, err := strconv.Atoi(numWorkers)
-	if err != nil || n < 2 {
-		n = 2
-	}
+	// if err != nil || n < 2 {
+	// 	n = 2
+	// }
 	log.Infof("Starting with %d worker(s). Using fsnotify to track JSON files in %s", n, resultsDir)
 
 	// Register Prometheus metrics
