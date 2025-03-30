@@ -675,11 +675,12 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
 					time.Now().Format(time.RFC3339),
 				)
 				// Queue the alert instead of sending immediately
-				if ntfyWebhookURL != "" {
+				if ntfyWebhookURL == "" {
 					log.Trace("ntfyWebhookURL not set, skipping alert")
+				} else {
 					sendAlert(ctx, report.ArtifactName, vuln.PkgName, vuln.VulnerabilityID, vuln.Severity, vuln.Description)
-					log.Debugf("New vulnerability recorded and queued for alert: %s", vuln.VulnerabilityID)
 				}
+				log.Debugf("New vulnerability recorded and queued for alert: %s", vuln.VulnerabilityID)
 			}
 		}
 	}
