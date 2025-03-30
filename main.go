@@ -601,6 +601,7 @@ func getEnv(key, def string) string {
 
 // sendAlert adds an alert to the processing queue if it's not already being processed
 func sendAlert(ctx context.Context, image, pkg, cveID, severity, description string) {
+	log.Debug("DEBUG sendalert")
 	_, span := otel.Tracer("trivy-exporter").Start(ctx, "QueueAlert")
 	defer span.End()
 
@@ -629,6 +630,7 @@ func sendAlert(ctx context.Context, image, pkg, cveID, severity, description str
 
 // processAlertBatches continuously processes alerts in batches
 func processAlertBatches(ctx context.Context) {
+	log.Debug("DEBUG processAlertBatches")
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ProcessBatchAlertes")
 	defer span.End()
 
@@ -670,6 +672,7 @@ func processAlertBatches(ctx context.Context) {
 
 // sendAlertBatch sends a batch of alerts as a single notification
 func sendAlertBatch(ctx context.Context, alerts []Alert) {
+	log.Debug("DEBUG sendAlertBatch")
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SendAlertBatch")
 	defer span.End()
 
