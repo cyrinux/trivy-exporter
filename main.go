@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bep/debounce"
 	dockerEvents "github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
@@ -440,31 +441,40 @@ func watchResultsDirectory(ctx context.Context) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "WatchResultsDirectory")
 	defer span.End()
 
+	// Initialize the file watcher
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatalf("Error creating fsnotify watcher: %v", err)
 	}
 	defer watcher.Close()
 
+	// Add the directory to the watcher
 	err = watcher.Add(resultsDir)
 	if err != nil {
 		log.Fatalf("Error watching %s: %v", resultsDir, err)
 	}
-	log.Debugf("Watching directory: %s", resultsDir)
+	log.Printf("Watching directory: %s", resultsDir)
 
+	// Initialize the debounced function with a 500ms delay
+	debounced := debounce.New(500 * time.Millisecond)
+
+	// Event handling loop
 	for {
 		select {
 		case event := <-watcher.Events:
+			// Process create events for .json files
 			if event.Op&fsnotify.Create != 0 && filepath.Ext(event.Name) == ".json" {
-				go parseTrivyReport(ctx, event.Name)
+				debounced(func() {
+					// Process the file (e.g., parseTrivyReport)
+					go parseTrivyReport(ctx, event.Name)
+				})
 			}
-		case werr := <-watcher.Errors:
-			if werr != nil {
-				log.Warnf("Fsnotify error: %v", werr)
+		case err := <-watcher.Errors:
+			if err != nil {
+				log.Warnf("Fsnotify error: %v", err)
 			}
 		}
 	}
-
 }
 
 // requestTrivyScan runs Trivy with a specified set of scanners

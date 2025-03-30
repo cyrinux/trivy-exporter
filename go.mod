@@ -3,6 +3,7 @@ module github.com/cyrinux/trivy-exporter
 go 1.24.1
 
 require (
+	github.com/bep/debounce v1.2.1
 	github.com/docker/docker v28.0.4+incompatible
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/grafana/otel-profiling-go v0.5.1
@@ -17,7 +18,7 @@ require (
 )
 
 require (
-	github.com/Microsoft/go-winio v0.4.14 // indirect
+	github.com/Microsoft/go-winio v0.4.15-0.20190919025122-fc70bd9a86b5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
