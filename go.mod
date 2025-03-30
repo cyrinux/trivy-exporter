@@ -5,7 +5,6 @@ go 1.24.1
 require (
 	github.com/bep/debounce v1.2.1
 	github.com/docker/docker v28.0.4+incompatible
-	github.com/fsnotify/fsnotify v1.8.0
 	github.com/grafana/otel-profiling-go v0.5.1
 	github.com/grafana/pyroscope-go v1.2.1
 	github.com/mattn/go-sqlite3 v1.14.24
