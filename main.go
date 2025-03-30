@@ -511,7 +511,10 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string) error
 	}
 	args = append(args, image)
 
-	cmd := exec.CommandContext(ctx, "trivy", args...)
+	scanContext, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(scanContext, "trivy", args...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("Trivy scan error for %s: %w", image, err)
 	}
