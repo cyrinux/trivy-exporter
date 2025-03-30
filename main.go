@@ -524,15 +524,9 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string) error
 	return nil
 }
 
-// parseTrivyReport reads the JSON file and saves vulnerabilities, then deletes the file
-var parseSem = make(chan struct{}, 5)
-
 func parseTrivyReport(ctx context.Context, filePath string) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ParseTrivyReport")
 	defer span.End()
-
-	parseSem <- struct{}{}
-	defer func() { <-parseSem }()
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -605,8 +599,8 @@ func getEnv(key, def string) string {
 	return def
 }
 
-// queueAlert adds an alert to the processing queue if it's not already being processed
-func queueAlert(ctx context.Context, image, pkg, cveID, severity, description string) {
+// sendAlert adds an alert to the processing queue if it's not already being processed
+func sendAlert(ctx context.Context, image, pkg, cveID, severity, description string) {
 	_, span := otel.Tracer("trivy-exporter").Start(ctx, "QueueAlert")
 	defer span.End()
 
@@ -741,19 +735,6 @@ func sendAlertBatch(ctx context.Context, alerts []Alert) {
 	log.Infof("Alert batch sent with status: %s", resp.Status)
 }
 
-// sendAlert sends a notification about a vulnerability to ntfy.sh (if configured).
-func sendAlert(ctx context.Context, image, pkg, cveID, severity, description string) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SendAlert")
-	defer span.End()
-
-	if ntfyWebhookURL == "" {
-		log.Debug("ntfyWebhookURL not set, skipping alert")
-		return
-	}
-
-	queueAlert(ctx, image, pkg, cveID, severity, description)
-}
-
 // saveVulnerabilitiesToDatabase inserts new vulnerabilities into the DB
 func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SaveVulnerabilitiesToDatabase")
@@ -785,8 +766,11 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
 					time.Now().Format(time.RFC3339),
 				)
 				// Queue the alert instead of sending immediately
-				sendAlert(ctx, report.ArtifactName, vuln.PkgName, vuln.VulnerabilityID, vuln.Severity, vuln.Description)
-				log.Debugf("New vulnerability recorded and queued for alert: %s", vuln.VulnerabilityID)
+				if ntfyWebhookURL != "" {
+					log.Trace("ntfyWebhookURL not set, skipping alert")
+					sendAlert(ctx, report.ArtifactName, vuln.PkgName, vuln.VulnerabilityID, vuln.Severity, vuln.Description)
+					log.Debugf("New vulnerability recorded and queued for alert: %s", vuln.VulnerabilityID)
+				}
 			}
 		}
 	}
