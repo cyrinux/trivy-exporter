@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,7 +19,6 @@ import (
 	dockerEvents "github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
-	"github.com/fsnotify/fsnotify"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
 	"github.com/grafana/pyroscope-go"
 	_ "github.com/mattn/go-sqlite3"
@@ -179,9 +177,6 @@ func main() {
 	for i := 0; i < n; i++ {
 		go worker(ctx, cli, scanQ, &wg)
 	}
-
-	// Watch the resultsDir for new JSON files using fsnotify
-	go watchResultsDirectory(ctx)
 
 	// Refresh metrics every 30s
 	go updateMetrics(ctx)
@@ -403,61 +398,16 @@ func saveImageChecksum(ctx context.Context, image, checksum string) {
 	}
 }
 
-// watchResultsDirectory uses fsnotify to detect .json file creation or writes in resultsDir
-func watchResultsDirectory(ctx context.Context) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "WatchResultsDirectory")
-	defer span.End()
-
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatalf("Error creating fsnotify watcher: %v", err)
-	}
-	defer watcher.Close()
-
-	err = watcher.Add(resultsDir)
-	if err != nil {
-		log.Fatalf("Error watching %s: %v", resultsDir, err)
-	}
-	log.Printf("Watching directory: %s", resultsDir)
-
-	debounced := debounce.New(500 * time.Millisecond)
-
-	for {
-		select {
-		case event := <-watcher.Events:
-			if event.Op&fsnotify.Create != 0 && filepath.Ext(event.Name) == ".json" {
-				debounced(func() {
-					go parseTrivyReport(ctx, event.Name)
-				})
-			}
-		case err := <-watcher.Errors:
-			if err != nil {
-				log.Warnf("Fsnotify error: %v", err)
-			}
-		}
-	}
-}
-
 // requestTrivyScan runs Trivy with a specified set of scanners
 func requestTrivyScan(ctx context.Context, image, server, scanners string) error {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "RequestTrivyScan")
 	defer span.End()
-
-	parts := strings.Split(image, ":")
-	baseName := parts[0]
-	tag := "latest"
-	if len(parts) > 1 {
-		tag = parts[1]
-	}
-	outFile := fmt.Sprintf("%s/%s_%s.json", resultsDir, strings.ReplaceAll(baseName, "/", "_"), tag)
-	tmpOutFile := filepath.Join(os.TempDir(), filepath.Base(outFile)+".tmp")
 
 	args := []string{
 		"image",
 		"--server", server,
 		"--scanners", scanners,
 		"--format", "json",
-		"--output", tmpOutFile,
 	}
 	if trivyExtraArgs != "" {
 		args = append(args, strings.Split(trivyExtraArgs, " ")...)
@@ -468,12 +418,18 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string) error
 	defer cancel()
 
 	cmd := exec.CommandContext(scanContext, "trivy", args...)
-	if err := cmd.Run(); err != nil {
+	stdout, err := cmd.Output()
+	if err != nil {
 		return fmt.Errorf("Trivy scan error for %s: %w", image, err)
 	}
-	if err := moveFile(ctx, tmpOutFile, outFile); err != nil {
-		return fmt.Errorf("Error renaming output file: %w", err)
+
+	var report TrivyReport
+	if err := json.Unmarshal(stdout, &report); err != nil {
+		return fmt.Errorf("Error unmarshaling Trivy output for %s: %w", image, err)
 	}
+
+	saveVulnerabilitiesToDatabase(ctx, report)
+
 	return nil
 }
 
@@ -727,29 +683,6 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
 			}
 		}
 	}
-}
-
-func moveFile(ctx context.Context, src, dst string) error {
-	_, span := otel.Tracer("trivy-exporter").Start(ctx, "MoveFile")
-	defer span.End()
-
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if _, err = io.Copy(out, in); err != nil {
-		return err
-	}
-
-	return os.Remove(src)
 }
 
 func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
