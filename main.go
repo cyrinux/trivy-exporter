@@ -437,7 +437,7 @@ func saveImageChecksum(ctx context.Context, image, checksum string) {
 
 // watchResultsDirectory uses fsnotify to detect .json file creation or writes in resultsDir
 func watchResultsDirectory(ctx context.Context) {
-	_, span := otel.Tracer("trivy-exporter").Start(ctx, "WatchResultsDirectory")
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "WatchResultsDirectory")
 	defer span.End()
 
 	watcher, err := fsnotify.NewWatcher()
@@ -446,43 +446,25 @@ func watchResultsDirectory(ctx context.Context) {
 	}
 	defer watcher.Close()
 
-	if err := watcher.Add(resultsDir); err != nil {
+	err = watcher.Add(resultsDir)
+	if err != nil {
 		log.Fatalf("Error watching %s: %v", resultsDir, err)
 	}
-
-	debounceMu := sync.Mutex{}
-	debounced := map[string]time.Time{}
-	debounceDuration := 500 * time.Millisecond
-	timer := time.NewTimer(debounceDuration)
-	defer timer.Stop()
-
-	for range timer.C {
-		now := time.Now()
-		debounceMu.Lock()
-		for file, t := range debounced {
-			if now.Sub(t) >= debounceDuration {
-				go parseTrivyReport(ctx, file)
-				delete(debounced, file)
-			}
-		}
-		debounceMu.Unlock()
-		timer.Reset(debounceDuration)
-	}
+	log.Debugf("Watching directory: %s", resultsDir)
 
 	for {
 		select {
 		case event := <-watcher.Events:
-			if event.Op&(fsnotify.Create|fsnotify.Write) != 0 && filepath.Ext(event.Name) == ".json" {
-				debounceMu.Lock()
-				debounced[event.Name] = time.Now()
-				debounceMu.Unlock()
+			if event.Op&fsnotify.Create != 0 && filepath.Ext(event.Name) == ".json" {
+				go parseTrivyReport(ctx, event.Name)
 			}
-		case err := <-watcher.Errors:
-			if err != nil {
-				log.Warnf("Fsnotify error: %v", err)
+		case werr := <-watcher.Errors:
+			if werr != nil {
+				log.Warnf("Fsnotify error: %v", werr)
 			}
 		}
 	}
+
 }
 
 // requestTrivyScan runs Trivy with a specified set of scanners
