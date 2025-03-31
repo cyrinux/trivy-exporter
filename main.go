@@ -23,6 +23,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	openai "github.com/sashabaranov/go-openai"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
@@ -43,9 +44,12 @@ var (
 	numWorkers        = getEnv("NUM_WORKERS", "1")
 	trivyExtraArgs    = getEnv("TRIVY_EXTRA_ARGS", "")
 	logLevel          = getEnv("LOG_LEVEL", "info")
-	db                *sql.DB
-	alertChannel      = make(chan Alert, 100) // Buffer size for pending alerts
-	alertsInProgress  sync.Map                // Track CVEs being processed to avoid duplicates
+	openAIAPIKey      = getEnv("OPENAI_API_KEY", "")
+	openAIModel       = getEnv("OPENAI_MODEL", "gpt-4-turbo")
+
+	db               *sql.DB
+	alertChannel     = make(chan Alert, 100) // Buffer size for pending alerts
+	alertsInProgress sync.Map                // Track CVEs being processed to avoid duplicates
 	// Prometheus metrics
 	vulnMetric = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -151,11 +155,14 @@ func main() {
 		log.Fatalf("Docker client error: %v", err)
 	}
 
+	analysisQ := make(chan TrivyVulnerability, 10)
+	go cveAnalysisWorker(ctx, analysisQ)
+
 	scanQ := make(chan imageScanItem, n)
 	var wg sync.WaitGroup
 
 	for i := 0; i < n; i++ {
-		go worker(ctx, cli, scanQ, &wg, i)
+		go worker(ctx, cli, scanQ, &wg, i, analysisQ)
 	}
 
 	go listenDockerEvents(ctx, cli, scanQ, &wg)
@@ -237,6 +244,17 @@ func initDatabase(ctx context.Context) {
 	if err != nil {
 		log.Fatalf("Failed to create index on image_scans table: %v", err)
 	}
+	_, err = db.ExecContext(ctx, `
+	    CREATE TABLE IF NOT EXISTS cve_analysis (
+	        vulnerability_id TEXT PRIMARY KEY,
+	        analysis TEXT,
+	        analyzed_at TIMESTAMP
+	    )
+	`)
+	if err != nil {
+		log.Fatalf("Failed to create cve_analysis table: %v", err)
+	}
+
 }
 
 // listenDockerEvents monitors Docker events. If container starts, we queue a scan with
@@ -286,7 +304,7 @@ func listenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<
 }
 
 // worker processes queued images, calling Trivy with the specified scanners
-func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanItem, wg *sync.WaitGroup, wid int) {
+func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanItem, wg *sync.WaitGroup, wid int, analysisQ chan<- TrivyVulnerability) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, fmt.Sprintf("Worker%v", wid))
 	defer span.End()
 
@@ -303,7 +321,7 @@ func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanI
 
 			markImageScanInProgress(ctx, item.Image)
 
-			if err := requestTrivyScan(ctx, item.Image, trivyServerURL, item.Scanners); err != nil {
+			if err := requestTrivyScan(ctx, item.Image, trivyServerURL, item.Scanners, analysisQ); err != nil {
 				log.Warnf("Trivy scan error for %s: %v", item.Image, err)
 			} else {
 				saveImageChecksum(ctx, item.Image, checksum)
@@ -371,7 +389,7 @@ func saveImageChecksum(ctx context.Context, image, checksum string) {
 }
 
 // requestTrivyScan runs Trivy with a specified set of scanners
-func requestTrivyScan(ctx context.Context, image, server, scanners string) error {
+func requestTrivyScan(ctx context.Context, image, server, scanners string, analysisQ chan<- TrivyVulnerability) error {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "RequestTrivyScan")
 	defer span.End()
 
@@ -400,7 +418,7 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string) error
 		return fmt.Errorf("Error unmarshaling Trivy output for %s: %w", image, err)
 	}
 
-	saveVulnerabilitiesToDatabase(ctx, report)
+	saveVulnerabilitiesToDatabase(ctx, report, analysisQ)
 
 	return nil
 }
@@ -459,30 +477,20 @@ func getEnv(key, def string) string {
 }
 
 // sendAlert adds an alert to the processing queue if it's not already being processed
-func sendAlert(ctx context.Context, image, pkg, cveID, severity, description string) {
-	_, span := otel.Tracer("trivy-exporter").Start(ctx, "QueueAlert")
-	defer span.End()
-
-	// Check if this CVE is already being processed
-	_, exists := alertsInProgress.LoadOrStore(cveID+":"+image, true)
-	if exists {
-		log.Debugf("Alert for CVE: %s on image: %s already queued, skipping", cveID, image)
-		return
+func sendAlert(ctx context.Context, vuln TrivyVulnerability, analysis string) {
+	alert := Alert{
+		Image:       vuln.PkgName,
+		Package:     vuln.PkgName,
+		CVEID:       vuln.VulnerabilityID,
+		Severity:    vuln.Severity,
+		Description: fmt.Sprintf("%s\n\nAnalysis:\n%s", vuln.Description, analysis),
 	}
 
-	// Queue the alert
 	select {
-	case alertChannel <- Alert{
-		Image:       image,
-		Package:     pkg,
-		CVEID:       cveID,
-		Severity:    severity,
-		Description: description,
-	}:
-		log.Debugf("Queued alert for CVE: %s on image: %s", cveID, image)
+	case alertChannel <- alert:
+		log.Debugf("Queued enhanced alert for CVE: %s", vuln.VulnerabilityID)
 	default:
-		log.Warnf("Alert queue full, dropping alert for CVE: %s on image: %s", cveID, image)
-		alertsInProgress.Delete(cveID + ":" + image)
+		log.Warnf("Alert queue full, dropping CVE alert: %s", vuln.VulnerabilityID)
 	}
 }
 
@@ -501,7 +509,7 @@ func processAlertBatches(ctx context.Context) {
 		for batchSize < 5 && !batchComplete {
 			select {
 			case alert := <-alertChannel:
-				log.Debugf("processAlertBatches %v", alert)
+				log.Tracef("Alert: %v", alert)
 				batch = append(batch, alert)
 				batchSize++
 			case <-time.After(100 * time.Millisecond):
@@ -595,25 +603,24 @@ func sendAlertBatch(ctx context.Context, alerts []Alert) {
 }
 
 // saveVulnerabilitiesToDatabase inserts new vulnerabilities into the DB
-func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SaveVulnerabilitiesToDatabase")
-	defer span.End()
-
+func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport, analysisQ chan<- TrivyVulnerability) {
 	imageName := strings.Split(report.ArtifactName, ":")[0]
 	for _, res := range report.Results {
 		for _, vuln := range res.Vulnerabilities {
-			row := db.QueryRowContext(ctx, `SELECT vulnerability_id FROM vulnerabilities WHERE vulnerability_id = ? AND image = ?`, vuln.VulnerabilityID, report.ArtifactName)
+			row := db.QueryRowContext(ctx, `
+				SELECT vulnerability_id FROM vulnerabilities
+				WHERE vulnerability_id = ? AND image = ?`,
+				vuln.VulnerabilityID, report.ArtifactName)
 			var existingID string
 			if err := row.Scan(&existingID); err != nil && err != sql.ErrNoRows {
 				continue
 			}
 			if existingID == "" {
-				_, err := db.Exec(`
-                    INSERT INTO vulnerabilities (
-                        vulnerability_id, image, image_name, package, package_version,
-                        severity, status, description, timestamp
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `,
+				_, err := db.ExecContext(ctx, `
+					INSERT INTO vulnerabilities (
+						vulnerability_id, image, image_name, package, package_version,
+						severity, status, description, timestamp
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					vuln.VulnerabilityID,
 					report.ArtifactName,
 					imageName,
@@ -625,16 +632,17 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
 					time.Now().Format(time.RFC3339),
 				)
 				if err != nil {
-					log.Debugf("Can't write vuln report to database")
+					log.Warnf("Can't write vuln %s to DB: %v", vuln.VulnerabilityID, err)
+					continue
 				}
 
-				// Queue the alert instead of sending immediately
-				if ntfyWebhookURL != "" {
-					sendAlert(ctx, report.ArtifactName, vuln.PkgName, vuln.VulnerabilityID, vuln.Severity, vuln.Description)
-				} else {
-					log.Trace("ntfyWebhookURL not set, skipping alert")
+				// Queue vulnerability for asynchronous analysis
+				select {
+				case analysisQ <- vuln:
+					log.Debugf("Queued CVE %s for analysis", vuln.VulnerabilityID)
+				default:
+					log.Warnf("Analysis queue full, dropping CVE: %s", vuln.VulnerabilityID)
 				}
-				log.Debugf("New vulnerability recorded and queued for alert: %s", vuln.VulnerabilityID)
 			}
 		}
 	}
@@ -707,5 +715,61 @@ func handleStatus(w http.ResponseWriter, _ *http.Request) {
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
+func cveAnalysisWorker(ctx context.Context, queue <-chan TrivyVulnerability) {
+	client := openAIClient()
+	for vuln := range queue {
+		if cachedAnalysis(ctx, vuln.VulnerabilityID) {
+			continue
+		}
+		prompt := fmt.Sprintf("Provide mitigation steps and fix recommendations for vulnerability %s affecting package %s version %s. Include official references if available.",
+			vuln.VulnerabilityID, vuln.PkgName, vuln.PkgVersion)
+
+		analysis, err := requestAnalysis(ctx, client, prompt)
+		if err != nil {
+			log.Warnf("OpenAI analysis error (%s): %v", vuln.VulnerabilityID, err)
+			continue
+		}
+
+		saveAnalysis(ctx, vuln.VulnerabilityID, analysis)
+		sendAlert(ctx, vuln, analysis)
+	}
+}
+
+func openAIClient() *openai.Client {
+	return openai.NewClient(openAIAPIKey)
+}
+
+func requestAnalysis(ctx context.Context, client *openai.Client, prompt string) (string, error) {
+	resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: openAIModel,
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: prompt},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	return resp.Choices[0].Message.Content, nil
+}
+
+func cachedAnalysis(ctx context.Context, vulnID string) bool {
+	var exists bool
+	err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM cve_analysis WHERE vulnerability_id=?)", vulnID).Scan(&exists)
+	if err != nil {
+		log.Warnf("DB error checking cache for %s: %v", vulnID, err)
+		return false
+	}
+	return exists
+}
+
+func saveAnalysis(ctx context.Context, vulnID, analysis string) {
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO cve_analysis (vulnerability_id, analysis, analyzed_at)
+		VALUES (?, ?, ?)`,
+		vulnID, analysis, time.Now().UTC())
+	if err != nil {
+		log.Warnf("DB error saving analysis for %s: %v", vulnID, err)
 	}
 }

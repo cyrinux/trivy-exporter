@@ -21,7 +21,7 @@ RUN go build -ldflags=" -w" -o main .
 FROM debian:bookworm-slim
 
 # Install Trivy CLI
-RUN apt-get update && apt-get install -y wget apt-transport-https gnupg lsb-release curl
+RUN apt-get update && apt-get install -y wget apt-transport-https gnupg lsb-release curl sqlite3
 RUN wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | apt-key add - && \
     echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | tee -a /etc/apt/sources.list.d/trivy.list && \
     apt-get update && apt-get install -y trivy
@@ -43,6 +43,9 @@ ENV SCAN_INTERVAL_MINUTES=15
 ENV NUM_WORKERS=1
 ENV TEMPO_ENDPOINT=localhost:4317
 ENV PYROSCOPE_ENDPOINT=http://localhost:4040
+ENV OPENAI_API_KEY=
+ENV OPENAI_MODEL=gpt-4-turbo
+
 
 # Health check configuration
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
