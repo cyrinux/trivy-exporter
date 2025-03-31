@@ -102,10 +102,11 @@ type HealthResponse struct {
 	CheckedAt string `json:"checked_at"`
 }
 
-// StatusResponse is the status response
+// DbStatusResponse is the status response
 // Returning some database info
-type StatusResponse struct {
-	CVECount string `json:"cve_count"`
+type DbStatusResponse struct {
+	CVECount  string `json:"cve_count"`
+	CheckedAt string `json:"checked_at"`
 }
 
 // init runs before main(), setting up logging and DB
@@ -147,22 +148,6 @@ func main() {
 		}
 	}()
 
-	profiler, err := pyroscope.Start(pyroscope.Config{
-		ApplicationName: "trivy-exporter",
-		ServerAddress:   pyroscopeEndpoint,
-		Tags: map[string]string{
-			"service_git_ref":    "main",
-			"service_repository": "https://github.com/cyrinux/trivy-exporter",
-		},
-	})
-	if err != nil {
-		log.Fatalf("failed to start pyroscope profiler: %v", err)
-	}
-	defer func() {
-		if err := profiler.Stop(); err != nil {
-			log.Errorf("Error shutting down profiler provider: %v", err)
-		}
-	}()
 	log.Infof("Starting with %d worker(s). Using fsnotify to track JSON files in %s", n, resultsDir)
 
 	opts := []client.Opt{client.WithAPIVersionNegotiation()}
@@ -196,8 +181,8 @@ func main() {
 	http.Handle("/metrics", otelhttp.NewHandler(http.HandlerFunc(handleMetrics), "Metrics"))
 	// Add the health check endpoint
 	http.Handle("/health", otelhttp.NewHandler(http.HandlerFunc(handleHealthCheck), "HealthCheck"))
-	// Add the status endpoint
-	http.Handle("/status", otelhttp.NewHandler(http.HandlerFunc(handleStatus), "Status"))
+	// Add the db status endpoint
+	http.Handle("/db/status", otelhttp.NewHandler(http.HandlerFunc(handleDbStatus), "Status"))
 
 	log.Infof("Listening on :8080, results stored in %s", resultsDir)
 	log.Fatal(http.ListenAndServe(":8080", nil))
@@ -691,6 +676,22 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 	)
 
 	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tpr))
+	profiler, err := pyroscope.Start(pyroscope.Config{
+		ApplicationName: "trivy-exporter",
+		ServerAddress:   pyroscopeEndpoint,
+		Tags: map[string]string{
+			"service_git_ref":    "main",
+			"service_repository": "https://github.com/cyrinux/trivy-exporter",
+		},
+	})
+	if err != nil {
+		log.Fatalf("failed to start pyroscope profiler: %v", err)
+	}
+	defer func() {
+		if err := profiler.Stop(); err != nil {
+			log.Errorf("Error shutting down profiler provider: %v", err)
+		}
+	}()
 	return tpr, nil
 }
 
@@ -710,15 +711,16 @@ func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
-func handleStatus(w http.ResponseWriter, _ *http.Request) {
+func handleDbStatus(w http.ResponseWriter, _ *http.Request) {
 	cve_count := "0"
 	err := db.QueryRow("SELECT count(*) from vulnerabilities").Scan(&cve_count)
 	if err != nil {
 		log.Debug("Can't query vuln count from database")
 	}
 
-	response := StatusResponse{
-		CVECount: cve_count,
+	response := DbStatusResponse{
+		CVECount:  cve_count,
+		CheckedAt: time.Now().Format(time.RFC3339),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
