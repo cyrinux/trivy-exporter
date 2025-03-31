@@ -165,7 +165,7 @@ func main() {
 
 	// Spawn worker goroutines
 	for i := 0; i < n; i++ {
-		go worker(ctx, cli, scanQ, &wg)
+		go worker(ctx, cli, scanQ, &wg, i)
 	}
 
 	// Listen for Docker container "start" events, queueing scans
@@ -304,8 +304,8 @@ func listenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<
 }
 
 // worker processes queued images, calling Trivy with the specified scanners
-func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanItem, wg *sync.WaitGroup) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Worker")
+func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanItem, wg *sync.WaitGroup, wid int) {
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, fmt.Sprintf("Worker%v", wid))
 	defer span.End()
 
 	for item := range scanQueue {
