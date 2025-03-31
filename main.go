@@ -102,11 +102,11 @@ type HealthResponse struct {
 	CheckedAt string `json:"checked_at"`
 }
 
-// DbStatusResponse is the status response
-// Returning some database info
-type DbStatusResponse struct {
-	CVECount  string `json:"cve_count"`
-	CheckedAt string `json:"checked_at"`
+// StatusResponse is the status response structure
+type StatusResponse struct {
+	CVECount   string `json:"cve_count"`
+	NumWorkers string `json:"num_workers"`
+	CheckedAt  string `json:"checked_at"`
 }
 
 // init runs before main(), setting up logging and DB
@@ -182,7 +182,7 @@ func main() {
 	// Add the health check endpoint
 	http.Handle("/health", otelhttp.NewHandler(http.HandlerFunc(handleHealthCheck), "HealthCheck"))
 	// Add the db status endpoint
-	http.Handle("/db/status", otelhttp.NewHandler(http.HandlerFunc(handleDbStatus), "Status"))
+	http.Handle("/db/status", otelhttp.NewHandler(http.HandlerFunc(handleStatus), "Status"))
 
 	log.Infof("Listening on :8080, results stored in %s", resultsDir)
 	log.Fatal(http.ListenAndServe(":8080", nil))
@@ -711,16 +711,17 @@ func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
-func handleDbStatus(w http.ResponseWriter, _ *http.Request) {
+func handleStatus(w http.ResponseWriter, _ *http.Request) {
 	cve_count := "0"
 	err := db.QueryRow("SELECT count(*) from vulnerabilities").Scan(&cve_count)
 	if err != nil {
 		log.Debug("Can't query vuln count from database")
 	}
 
-	response := DbStatusResponse{
-		CVECount:  cve_count,
-		CheckedAt: time.Now().Format(time.RFC3339),
+	response := StatusResponse{
+		CVECount:   cve_count,
+		NumWorkers: numWorkers,
+		CheckedAt:  time.Now().Format(time.RFC3339),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
