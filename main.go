@@ -723,7 +723,7 @@ func cveAnalysisWorker(ctx context.Context, queue <-chan TrivyVulnerability) {
 		if cachedAnalysis(ctx, vuln.VulnerabilityID) {
 			continue
 		}
-		prompt := fmt.Sprintf("Provide mitigation steps and fix recommendations for vulnerability %s affecting package %s version %s. Include official references if available.",
+		prompt := fmt.Sprintf("Search on internet and provide mitigation steps and fix recommendations for vulnerability %s affecting package %s version %s. Include official references if available.",
 			vuln.VulnerabilityID, vuln.PkgName, vuln.PkgVersion)
 
 		analysis, err := requestAnalysis(ctx, client, prompt)
@@ -756,7 +756,7 @@ func requestAnalysis(ctx context.Context, client *openai.Client, prompt string) 
 
 func cachedAnalysis(ctx context.Context, vulnID string) bool {
 	var exists bool
-	err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM cve_analysis WHERE vulnerability_id=?)", vulnID).Scan(&exists)
+	err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT vulnerability_id FROM cve_analysis WHERE vulnerability_id=?)", vulnID).Scan(&exists)
 	if err != nil {
 		log.Warnf("DB error checking cache for %s: %v", vulnID, err)
 		return false
