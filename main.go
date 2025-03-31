@@ -15,8 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bep/debounce"
-	dockerEvents "github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
@@ -39,8 +38,8 @@ var (
 	dockerHost        = getEnv("DOCKER_HOST", "unix:///var/run/docker.sock")
 	trivyServerURL    = getEnv("TRIVY_SERVER_URL", "http://localhost:4954")
 	ntfyWebhookURL    = getEnv("NTFY_WEBHOOK_URL", "https://ntfy.sh/vulns")
-	tempoEndpoint     = getEnv("TEMPO_ENDPOINT", "localhost:4317")
-	pyroscopeEndpoint = getEnv("PYROSCOPE_ENDPOINT", "localhost:4040")
+	tempoEndpoint     = getEnv("TEMPO_ENDPOINT", "localhost:4317") // change to http or grpc
+	pyroscopeEndpoint = getEnv("PYROSCOPE_ENDPOINT", "http://localhost:4040")
 	numWorkers        = getEnv("NUM_WORKERS", "1")
 	trivyExtraArgs    = getEnv("TRIVY_EXTRA_ARGS", "")
 	logLevel          = getEnv("LOG_LEVEL", "info")
@@ -103,6 +102,12 @@ type HealthResponse struct {
 	CheckedAt string `json:"checked_at"`
 }
 
+// StatusResponse is the status response
+// Returning some database info
+type StatusResponse struct {
+	CVECount string `json:"cve_count"`
+}
+
 // init runs before main(), setting up logging and DB
 func init() {
 	lvl, err := log.ParseLevel(logLevel)
@@ -117,6 +122,17 @@ func init() {
 // main starts the program, spawning watchers, listeners, and the HTTP server
 func main() {
 	ctx := context.Background()
+
+	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Main")
+	defer span.End()
+
+	n, err := strconv.Atoi(numWorkers)
+	if err != nil {
+		n = 1
+	}
+
+	// Register Prometheus metrics
+	prometheus.MustRegister(vulnMetric, vulnTimestampMetric)
 
 	initDatabase(ctx)
 	defer db.Close()
@@ -147,18 +163,7 @@ func main() {
 			log.Errorf("Error shutting down profiler provider: %v", err)
 		}
 	}()
-
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Main")
-	defer span.End()
-
-	n, err := strconv.Atoi(numWorkers)
-	// if err != nil || n < 2 {
-	// 	n = 2
-	// }
 	log.Infof("Starting with %d worker(s). Using fsnotify to track JSON files in %s", n, resultsDir)
-
-	// Register Prometheus metrics
-	prometheus.MustRegister(vulnMetric, vulnTimestampMetric)
 
 	opts := []client.Opt{client.WithAPIVersionNegotiation()}
 	if dockerHost != "unix:///var/run/docker.sock" {
@@ -178,19 +183,21 @@ func main() {
 		go worker(ctx, cli, scanQ, &wg)
 	}
 
-	// Refresh metrics every 30s
-	go updateMetrics(ctx)
-
 	// Listen for Docker container "start" events, queueing scans
 	go listenDockerEvents(ctx, cli, scanQ, &wg)
 
 	// Start the alert batch processor
 	go processAlertBatches(ctx)
 
+	// Refresh metrics loop
+	go updateMetrics(ctx)
+
 	// Provide /metrics for Prometheus
 	http.Handle("/metrics", otelhttp.NewHandler(http.HandlerFunc(handleMetrics), "Metrics"))
 	// Add the health check endpoint
 	http.Handle("/health", otelhttp.NewHandler(http.HandlerFunc(handleHealthCheck), "HealthCheck"))
+	// Add the status endpoint
+	http.Handle("/status", otelhttp.NewHandler(http.HandlerFunc(handleStatus), "Status"))
 
 	log.Infof("Listening on :8080, results stored in %s", resultsDir)
 	log.Fatal(http.ListenAndServe(":8080", nil))
@@ -204,15 +211,10 @@ func updateMetrics(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	// Initialize the debounced function with a 500ms delay
-	debounced := debounce.New(10 * time.Second)
-
 	for {
 		select {
 		case <-ticker.C:
-			debounced(func() {
-				go updateMetricsFromDatabase(ctx)
-			})
+			updateMetricsFromDatabase(ctx)
 		case <-ctx.Done():
 			return
 		}
@@ -280,11 +282,11 @@ func listenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<
 
 	filterArgs := filters.NewArgs()
 	filterArgs.Add("event", "start")
-	evCh, errCh := cli.Events(ctx, dockerEvents.ListOptions{Filters: filterArgs})
+	evCh, errCh := cli.Events(ctx, events.ListOptions{Filters: filterArgs})
 	for {
 		select {
 		case evt := <-evCh:
-			if evt.Type == dockerEvents.ContainerEventType {
+			if evt.Type == events.ContainerEventType {
 				info, e2 := cli.ContainerInspect(ctx, evt.Actor.ID)
 				if e2 != nil {
 					log.Debugf("Error inspecting container %s: %v", evt.Actor.ID, e2)
@@ -431,26 +433,6 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string) error
 	saveVulnerabilitiesToDatabase(ctx, report)
 
 	return nil
-}
-
-func parseTrivyReport(ctx context.Context, filePath string) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ParseTrivyReport")
-	defer span.End()
-
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		log.Debugf("Error reading %s: %v", filePath, err)
-		return
-	}
-	var rep TrivyReport
-	if err := json.Unmarshal(data, &rep); err != nil {
-		log.Debugf("Error unmarshaling JSON: %v", err)
-		return
-	}
-	saveVulnerabilitiesToDatabase(ctx, rep)
-	if err := os.Remove(filePath); err != nil {
-		log.Debugf("Error removing %s: %v", filePath, err)
-	}
 }
 
 // updateMetricsFromDatabase reads DB vulnerabilities and updates Prometheus metrics
@@ -658,7 +640,7 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
 				continue
 			}
 			if existingID == "" {
-				_, _ = db.Exec(`
+				_, err := db.Exec(`
                     INSERT INTO vulnerabilities (
                         vulnerability_id, image, image_name, package, package_version,
                         severity, status, description, timestamp
@@ -674,11 +656,15 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
 					vuln.Description,
 					time.Now().Format(time.RFC3339),
 				)
+				if err != nil {
+					log.Debugf("Can't write vuln report to database")
+				}
+
 				// Queue the alert instead of sending immediately
-				if ntfyWebhookURL == "" {
-					log.Trace("ntfyWebhookURL not set, skipping alert")
-				} else {
+				if ntfyWebhookURL != "" {
 					sendAlert(ctx, report.ArtifactName, vuln.PkgName, vuln.VulnerabilityID, vuln.Severity, vuln.Description)
+				} else {
+					log.Trace("ntfyWebhookURL not set, skipping alert")
 				}
 				log.Debugf("New vulnerability recorded and queued for alert: %s", vuln.VulnerabilityID)
 			}
@@ -709,22 +695,36 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 }
 
 func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
-	// Create the health check response struct
 	response := HealthResponse{
 		Status:    "ok",
 		Message:   "Service is healthy",
 		CheckedAt: time.Now().Format(time.RFC3339),
 	}
 
-	// Set the response content type as JSON
 	w.Header().Set("Content-Type", "application/json")
-
-	// Return status code 200 (OK)
 	w.WriteHeader(http.StatusOK)
 
-	// Encode the response as JSON and write it to the response body
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		// Handle encoding error
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
+
+func handleStatus(w http.ResponseWriter, _ *http.Request) {
+	cve_count := "0"
+	err := db.QueryRow("SELECT count(*) from vulnerabilities").Scan(&cve_count)
+	if err != nil {
+		log.Debug("Can't query vuln count from database")
+	}
+
+	response := StatusResponse{
+		CVECount: cve_count,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 	}
 }
