@@ -717,8 +717,15 @@ func handleStatus(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 	}
 }
+
 func cveAnalysisWorker(ctx context.Context, queue <-chan TrivyVulnerability) {
+	if openAIAPIKey == "" {
+		log.Info("Skipping CVE analysis worker: OPENAI_API_KEY not set")
+		return
+	}
+
 	client := openAIClient()
+
 	for vuln := range queue {
 		if cachedAnalysis(ctx, vuln.VulnerabilityID) {
 			continue
