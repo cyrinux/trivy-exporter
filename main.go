@@ -123,7 +123,6 @@ func init() {
 // main starts the program, spawning watchers, listeners, and the HTTP server
 func main() {
 	ctx := context.Background()
-
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Main")
 	defer span.End()
 
@@ -132,23 +131,16 @@ func main() {
 		n = 1
 	}
 
-	// Register Prometheus metrics
 	prometheus.MustRegister(vulnMetric, vulnTimestampMetric)
 
 	initDatabase(ctx)
 	defer db.Close()
 
-	tp, err := initTracer(ctx)
-	if err != nil {
-		log.Fatalf("failed to initialize tracer: %v", err)
-	}
+	tp, profiler := initTracer(ctx)
 	defer func() {
-		if err := tp.Shutdown(ctx); err != nil {
-			log.Errorf("Error shutting down tracer provider: %v", err)
-		}
+		_ = profiler.Stop()
+		_ = tp.Shutdown(ctx)
 	}()
-
-	log.Infof("Starting with %d worker(s). Using fsnotify to track JSON files in %s", n, resultsDir)
 
 	opts := []client.Opt{client.WithAPIVersionNegotiation()}
 	if dockerHost != "unix:///var/run/docker.sock" {
@@ -156,32 +148,22 @@ func main() {
 	}
 	cli, err := client.NewClientWithOpts(opts...)
 	if err != nil {
-		log.Fatalf("Error creating Docker client: %v", err)
+		log.Fatalf("Docker client error: %v", err)
 	}
 
-	// Channel of imageScanItem structs for scans
 	scanQ := make(chan imageScanItem, n)
 	var wg sync.WaitGroup
 
-	// Spawn worker goroutines
 	for i := 0; i < n; i++ {
 		go worker(ctx, cli, scanQ, &wg, i)
 	}
 
-	// Listen for Docker container "start" events, queueing scans
 	go listenDockerEvents(ctx, cli, scanQ, &wg)
-
-	// Start the alert batch processor
 	go processAlertBatches(ctx)
-
-	// Refresh metrics loop
 	go updateMetrics(ctx)
 
-	// Provide /metrics for Prometheus
 	http.Handle("/metrics", otelhttp.NewHandler(http.HandlerFunc(handleMetrics), "Metrics"))
-	// Add the health check endpoint
 	http.Handle("/health", otelhttp.NewHandler(http.HandlerFunc(handleHealthCheck), "HealthCheck"))
-	// Add the db status endpoint
 	http.Handle("/db/status", otelhttp.NewHandler(http.HandlerFunc(handleStatus), "Status"))
 
 	log.Infof("Listening on :8080, results stored in %s", resultsDir)
@@ -309,24 +291,24 @@ func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanI
 	defer span.End()
 
 	for item := range scanQueue {
-		checksum := getImageDigest(ctx, cli, item.Image)
+		func() {
+			defer wg.Done()
 
-		// First check if already scanned (or in progress)
-		if alreadyScanned(ctx, item.Image, checksum) {
-			log.Debugf("Skipping already scanned or in-progress image: %s", item.Image)
-			wg.Done()
-			continue
-		}
+			checksum := getImageDigest(ctx, cli, item.Image)
 
-		// Mark as in-progress immediately, before starting the scan
-		markImageScanInProgress(ctx, item.Image)
+			if alreadyScanned(ctx, item.Image, checksum) {
+				log.Debugf("Skipping scanned/in-progress image: %s", item.Image)
+				return
+			}
 
-		if err := requestTrivyScan(ctx, item.Image, trivyServerURL, item.Scanners); err != nil {
-			log.Warnf("Trivy scan error for %s: %v", item.Image, err)
-		} else {
-			saveImageChecksum(ctx, item.Image, checksum)
-		}
-		wg.Done()
+			markImageScanInProgress(ctx, item.Image)
+
+			if err := requestTrivyScan(ctx, item.Image, trivyServerURL, item.Scanners); err != nil {
+				log.Warnf("Trivy scan error for %s: %v", item.Image, err)
+			} else {
+				saveImageChecksum(ctx, item.Image, checksum)
+			}
+		}()
 	}
 }
 
@@ -349,12 +331,15 @@ func alreadyScanned(ctx context.Context, image, checksum string) bool {
 
 	var dbChecksum, status string
 	err := db.QueryRowContext(ctx, "SELECT checksum, status FROM image_scans WHERE image = ?", image).Scan(&dbChecksum, &status)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false
+		}
+		log.Warnf("DB error in alreadyScanned for %s: %v", image, err)
+		return false
+	}
 
-	// If we find the image in the database and either:
-	// 1. It's the same checksum and status is "completed" or
-	// 2. Status is "in_progress" (regardless of checksum)
-	// then we consider it already scanned or being scanned
-	return err == nil && (dbChecksum == checksum && status == "completed" || status == "in_progress")
+	return (dbChecksum == checksum && status == "completed") || status == "in_progress"
 }
 
 func markImageScanInProgress(ctx context.Context, image string) {
@@ -425,26 +410,17 @@ func updateMetricsFromDatabase(ctx context.Context) {
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "UpdateMetricsFromDatabase")
 	defer span.End()
 
-	log.Trace("Starting updateMetrics")
-
 	vulnMetric.Reset()
 	vulnTimestampMetric.Reset()
 
 	rows, err := db.QueryContext(ctx, `
 		SELECT 
-			image,
-			image_name,
-			package,
-			package_version,
-			vulnerability_id,
-			severity,
-			status,
-			description,
-			timestamp
+			image, image_name, package, package_version, vulnerability_id,
+			severity, status, description, timestamp
 		FROM vulnerabilities
 	`)
 	if err != nil {
-		log.Warnf("Error querying DB: %v", err)
+		log.Warnf("DB query error: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -454,16 +430,23 @@ func updateMetricsFromDatabase(ctx context.Context) {
 			image, imageName, pkg, pkgVersion, vulnID, sev, status, desc, ts string
 		)
 		if err := rows.Scan(&image, &imageName, &pkg, &pkgVersion, &vulnID, &sev, &status, &desc, &ts); err != nil {
+			log.Warnf("DB row scan error: %v", err)
 			continue
 		}
 		vulnMetric.WithLabelValues(image, imageName, pkg, pkgVersion, vulnID, sev, status, desc).Set(1)
-		vulnTimestampMetric.WithLabelValues(image, vulnID).Set(float64(time.Now().Unix()))
+
+		parsedTime, err := time.Parse(time.RFC3339, ts)
+		if err != nil {
+			log.Warnf("Timestamp parse error for %s: %v", vulnID, err)
+			continue
+		}
+		vulnTimestampMetric.WithLabelValues(image, vulnID).Set(float64(parsedTime.Unix()))
 	}
 }
 
 // handleMetrics is the handler for /metrics
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
-	log.Debug("Serving /metrics")
+	log.Trace("Serving /metrics")
 	promhttp.Handler().ServeHTTP(w, r)
 }
 
@@ -657,13 +640,13 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport) {
 	}
 }
 
-func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
+func initTracer(ctx context.Context) (*sdktrace.TracerProvider, *pyroscope.Profiler) {
 	exporter, err := otlptracegrpc.New(ctx,
 		otlptracegrpc.WithEndpoint(tempoEndpoint),
 		otlptracegrpc.WithInsecure(),
 	)
 	if err != nil {
-		return nil, err
+		log.Fatalf("Tracer error: %v", err)
 	}
 
 	tpr := sdktrace.NewTracerProvider(
@@ -685,14 +668,9 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 		},
 	})
 	if err != nil {
-		log.Fatalf("failed to start pyroscope profiler: %v", err)
+		log.Fatalf("Pyroscope profiler error: %v", err)
 	}
-	defer func() {
-		if err := profiler.Stop(); err != nil {
-			log.Errorf("Error shutting down profiler provider: %v", err)
-		}
-	}()
-	return tpr, nil
+	return tpr, profiler
 }
 
 func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
