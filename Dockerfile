@@ -14,8 +14,8 @@ RUN go mod download
 COPY . .
 
 # Build the Go app
-# RUN go build -ldflags="-s -w" -o main .
-RUN go build -ldflags=" -w" -o main .
+# RUN go build -ldflags="-s -w" -o trivy-exporter .
+RUN go build -ldflags=" -w" -o trivy-exporter .
 
 # Stage 2: Run the application
 FROM debian:bookworm-slim
@@ -30,7 +30,7 @@ RUN wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | apt-ke
 WORKDIR /app
 
 # Copy the Pre-built binary file from the previous stage
-COPY --from=builder /app/main .
+COPY --from=builder /app/trivy-exporter .
 
 # Set environment variables
 ENV LOG_LEVEL=info
@@ -55,4 +55,4 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
 EXPOSE 8080
 
 # Command to run the executable
-CMD ["./main"]
+CMD ["./trivy-exporter"]
