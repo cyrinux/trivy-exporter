@@ -649,7 +649,7 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport, anal
 					time.Now().Format(time.RFC3339),
 				)
 				if err != nil {
-					log.Warnf("Can't write vuln %s to DB: %v", vuln.VulnerabilityID, err)
+					log.Tracef("Can't write vuln %s to DB: %v", vuln.VulnerabilityID, err)
 					continue
 				}
 
