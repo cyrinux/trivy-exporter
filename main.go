@@ -669,6 +669,7 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport, anal
 				}
 
 				// Queue vulnerability for asynchronous analysis
+				vuln.Image = report.ArtifactName
 				select {
 				case analysisQ <- vuln:
 					log.Debugf("Queued CVE %s for analysis", vuln.VulnerabilityID)
