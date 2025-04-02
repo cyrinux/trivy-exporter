@@ -34,6 +34,8 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
+const appname = "trivy-exporter"
+
 // Environment variables
 var (
 	resultsDir        = getEnv("RESULTS_DIR", "/results")
@@ -71,6 +73,7 @@ var (
 
 // TrivyVulnerability represents a single vulnerability from the Trivy JSON report
 type TrivyVulnerability struct {
+	Image           string `json:"Image"`
 	VulnerabilityID string `json:"VulnerabilityID"`
 	PkgName         string `json:"PkgName"`
 	PkgVersion      string `json:"PkgVersion"`
@@ -129,7 +132,7 @@ func init() {
 // main starts the program, spawning watchers, listeners, and the HTTP server
 func main() {
 	rootCtx, cancel := context.WithCancel(context.Background())
-	ctx, span := otel.Tracer("trivy-exporter").Start(rootCtx, "Main")
+	ctx, span := otel.Tracer(appname).Start(rootCtx, "Main")
 	defer span.End()
 
 	// Graceful shutdown handler
@@ -195,7 +198,7 @@ func waitForShutdown(cancel context.CancelFunc) {
 
 // updateMetrics call updateMetricsFromDatabase in loop
 func updateMetrics(ctx context.Context) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "UpdateMetrics")
+	ctx, span := otel.Tracer(appname).Start(ctx, "UpdateMetrics")
 	defer span.End()
 
 	ticker := time.NewTicker(5 * time.Second)
@@ -213,7 +216,7 @@ func updateMetrics(ctx context.Context) {
 
 // initDatabase opens or creates the DB and ensures we have required tables
 func initDatabase(ctx context.Context) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "InitDatabase")
+	ctx, span := otel.Tracer(appname).Start(ctx, "InitDatabase")
 	defer span.End()
 
 	var err error
@@ -278,7 +281,7 @@ func initDatabase(ctx context.Context) {
 // listenDockerEvents monitors Docker events. If container starts, we queue a scan with
 // user-specified scanners from the "trivy.scanners" label or default "vuln"
 func listenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<- imageScanItem, wg *sync.WaitGroup) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ListenDockerEvents")
+	ctx, span := otel.Tracer(appname).Start(ctx, "ListenDockerEvents")
 	defer span.End()
 
 	filterArgs := filters.NewArgs()
@@ -322,7 +325,7 @@ func listenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<
 
 // worker processes queued images, calling Trivy with the specified scanners
 func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanItem, wg *sync.WaitGroup, wid int, analysisQ chan<- TrivyVulnerability) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, fmt.Sprintf("Worker%v", wid))
+	ctx, span := otel.Tracer(appname).Start(ctx, fmt.Sprintf("Worker%v", wid))
 	defer span.End()
 
 	for {
@@ -360,7 +363,7 @@ func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanI
 }
 
 func getImageDigest(ctx context.Context, cli *client.Client, image string) string {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "GetImageDigest")
+	ctx, span := otel.Tracer(appname).Start(ctx, "GetImageDigest")
 	defer span.End()
 
 	imgInspect, err := cli.ImageInspect(ctx, image)
@@ -373,7 +376,7 @@ func getImageDigest(ctx context.Context, cli *client.Client, image string) strin
 }
 
 func alreadyScanned(ctx context.Context, image, checksum string) bool {
-	_, span := otel.Tracer("trivy-exporter").Start(ctx, "AlreadyScanned")
+	ctx, span := otel.Tracer(appname).Start(ctx, "AlreadyScanned")
 	defer span.End()
 
 	var dbChecksum, status string
@@ -390,7 +393,7 @@ func alreadyScanned(ctx context.Context, image, checksum string) bool {
 }
 
 func markImageScanInProgress(ctx context.Context, image string) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "MarkImageScanInProgress")
+	ctx, span := otel.Tracer(appname).Start(ctx, "MarkImageScanInProgress")
 	defer span.End()
 
 	_, err := db.ExecContext(ctx, `
@@ -404,7 +407,7 @@ func markImageScanInProgress(ctx context.Context, image string) {
 }
 
 func saveImageChecksum(ctx context.Context, image, checksum string) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SaveImageChecksum")
+	ctx, span := otel.Tracer(appname).Start(ctx, "SaveImageChecksum")
 	defer span.End()
 
 	_, err := db.ExecContext(ctx, `
@@ -419,7 +422,7 @@ func saveImageChecksum(ctx context.Context, image, checksum string) {
 
 // requestTrivyScan runs Trivy with a specified set of scanners
 func requestTrivyScan(ctx context.Context, image, server, scanners string, analysisQ chan<- TrivyVulnerability) error {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "RequestTrivyScan")
+	ctx, span := otel.Tracer(appname).Start(ctx, "RequestTrivyScan")
 	defer span.End()
 
 	args := []string{
@@ -433,7 +436,7 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string, analy
 	}
 	args = append(args, image)
 
-	scanContext, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	scanContext, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
 	cmd := exec.CommandContext(scanContext, "trivy", args...)
@@ -454,7 +457,7 @@ func requestTrivyScan(ctx context.Context, image, server, scanners string, analy
 
 // updateMetricsFromDatabase reads DB vulnerabilities and updates Prometheus metrics
 func updateMetricsFromDatabase(ctx context.Context) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "UpdateMetricsFromDatabase")
+	ctx, span := otel.Tracer(appname).Start(ctx, "UpdateMetricsFromDatabase")
 	defer span.End()
 
 	vulnMetric.Reset()
@@ -508,7 +511,7 @@ func getEnv(key, def string) string {
 // sendAlert adds an alert to the processing queue if it's not already being processed
 func sendAlert(ctx context.Context, vuln TrivyVulnerability, analysis string) {
 	alert := Alert{
-		Image:       vuln.PkgName,
+		Image:       vuln.Image,
 		Package:     vuln.PkgName,
 		CVEID:       vuln.VulnerabilityID,
 		Severity:    vuln.Severity,
@@ -525,7 +528,7 @@ func sendAlert(ctx context.Context, vuln TrivyVulnerability, analysis string) {
 
 // processAlertBatches continuously processes alerts in batches
 func processAlertBatches(ctx context.Context) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "ProcessBatchAlertes")
+	ctx, span := otel.Tracer(appname).Start(ctx, "ProcessBatchAlertes")
 	defer span.End()
 
 	for {
@@ -566,7 +569,7 @@ func processAlertBatches(ctx context.Context) {
 
 // sendAlertBatch sends a batch of alerts as a single notification
 func sendAlertBatch(ctx context.Context, alerts []Alert) {
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "SendAlertBatch")
+	ctx, span := otel.Tracer(appname).Start(ctx, "SendAlertBatch")
 	defer span.End()
 
 	if ntfyWebhookURL == "" || len(alerts) == 0 {
@@ -690,14 +693,14 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, *pyroscope.Profi
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
-			semconv.ServiceName("trivy-exporter"),
+			semconv.ServiceName(appname),
 			semconv.ServiceVersion("1.2.0"),
 		)),
 	)
 
 	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tpr))
 	profiler, err := pyroscope.Start(pyroscope.Config{
-		ApplicationName: "trivy-exporter",
+		ApplicationName: appname,
 		ServerAddress:   pyroscopeEndpoint,
 		Tags: map[string]string{
 			"service_git_ref":    "main",
