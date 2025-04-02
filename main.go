@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -46,6 +47,7 @@ var (
 	logLevel          = getEnv("LOG_LEVEL", "info")
 	openAIAPIKey      = getEnv("OPENAI_API_KEY", "")
 	openAIModel       = getEnv("OPENAI_MODEL", "gpt-4-turbo")
+	scanners          = "vuln"
 
 	db               *sql.DB
 	alertChannel     = make(chan Alert, 100) // Buffer size for pending alerts
@@ -126,9 +128,12 @@ func init() {
 
 // main starts the program, spawning watchers, listeners, and the HTTP server
 func main() {
-	ctx := context.Background()
-	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, "Main")
+	rootCtx, cancel := context.WithCancel(context.Background())
+	ctx, span := otel.Tracer("trivy-exporter").Start(rootCtx, "Main")
 	defer span.End()
+
+	// Graceful shutdown handler
+	go waitForShutdown(cancel)
 
 	n, err := strconv.Atoi(numWorkers)
 	if err != nil {
@@ -136,7 +141,6 @@ func main() {
 	}
 
 	prometheus.MustRegister(vulnMetric, vulnTimestampMetric)
-
 	initDatabase(ctx)
 	defer db.Close()
 
@@ -175,6 +179,18 @@ func main() {
 
 	log.Infof("Listening on :8080, results stored in %s", resultsDir)
 	log.Fatal(http.ListenAndServe(":8080", nil))
+
+	// Wait all workers before exit
+	wg.Wait()
+	close(scanQ)
+}
+
+func waitForShutdown(cancel context.CancelFunc) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	<-c
+	log.Info("Interrupt received, shutting down...")
+	cancel()
 }
 
 // updateMetrics call updateMetricsFromDatabase in loop
@@ -268,8 +284,12 @@ func listenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<
 	filterArgs := filters.NewArgs()
 	filterArgs.Add("event", "start")
 	evCh, errCh := cli.Events(ctx, events.ListOptions{Filters: filterArgs})
+
 	for {
 		select {
+		case <-ctx.Done():
+			log.Info("Stopping Docker events listener")
+			return
 		case evt := <-evCh:
 			if evt.Type == events.ContainerEventType {
 				info, e2 := cli.ContainerInspect(ctx, evt.Actor.ID)
@@ -277,23 +297,20 @@ func listenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<
 					log.Debugf("Error inspecting container %s: %v", evt.Actor.ID, e2)
 					continue
 				}
-				// Check if label "trivy.scan" is false, skip
 				if skip, ok := info.Config.Labels["trivy.scan"]; ok && skip == "false" {
-					log.Debugf("Skipping container with trivy.scan=false: %s", info.Config.Image)
 					continue
 				}
-				// If label "trivy.scanners" is set, use that, otherwise default to "vuln"
-				scanners := "vuln"
+				scannersToUse := scanners
 				if custom, ok := info.Config.Labels["trivy.scanners"]; ok && strings.TrimSpace(custom) != "" {
-					scanners = custom
-					log.Debugf("Using custom scanners '%s' for %s", scanners, info.Config.Image)
+					scannersToUse = custom
 				}
 				wg.Add(1)
-
-				// Use blocking send instead of select+default
-				log.Debugf("Queueing %s for scanning (scanners: %s) - will wait if queue is full", info.Config.Image, scanners)
-				scanQueue <- imageScanItem{Image: info.Config.Image, Scanners: scanners}
-				log.Debugf("Successfully queued %s for scanning", info.Config.Image)
+				select {
+				case scanQueue <- imageScanItem{Image: info.Config.Image, Scanners: scannersToUse}:
+				case <-ctx.Done():
+					wg.Done()
+					return
+				}
 			}
 		case e := <-errCh:
 			if e != nil {
