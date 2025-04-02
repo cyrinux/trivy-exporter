@@ -325,25 +325,37 @@ func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanI
 	ctx, span := otel.Tracer("trivy-exporter").Start(ctx, fmt.Sprintf("Worker%v", wid))
 	defer span.End()
 
-	for item := range scanQueue {
-		func() {
-			defer wg.Done()
-
-			checksum := getImageDigest(ctx, cli, item.Image)
-
-			if alreadyScanned(ctx, item.Image, checksum) {
-				log.Debugf("Skipping scanned/in-progress image: %s", item.Image)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item, ok := <-scanQueue:
+			if !ok {
 				return
 			}
+			func() {
+				defer wg.Done()
 
-			markImageScanInProgress(ctx, item.Image)
+				// Skip if context cancelled mid-loop
+				if ctx.Err() != nil {
+					return
+				}
 
-			if err := requestTrivyScan(ctx, item.Image, trivyServerURL, item.Scanners, analysisQ); err != nil {
-				log.Warnf("Trivy scan error for %s: %v", item.Image, err)
-			} else {
-				saveImageChecksum(ctx, item.Image, checksum)
-			}
-		}()
+				checksum := getImageDigest(ctx, cli, item.Image)
+
+				if alreadyScanned(ctx, item.Image, checksum) {
+					return
+				}
+
+				markImageScanInProgress(ctx, item.Image)
+
+				if err := requestTrivyScan(ctx, item.Image, trivyServerURL, item.Scanners, analysisQ); err != nil {
+					log.Warnf("Trivy scan error for %s: %v", item.Image, err)
+				} else {
+					saveImageChecksum(ctx, item.Image, checksum)
+				}
+			}()
+		}
 	}
 }
 
