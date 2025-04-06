@@ -35,6 +35,7 @@ import (
 )
 
 const appname = "trivy-exporter"
+const trivyPrompt = "Provide mitigation steps and fix recommendations for vulnerability %s affecting package %s version %s. Include official references if available."
 
 // Environment variables
 var (
@@ -763,7 +764,7 @@ func cveAnalysisWorker(ctx context.Context, queue <-chan TrivyVulnerability) {
 		if cachedAnalysis(ctx, vuln.VulnerabilityID) {
 			continue
 		}
-		prompt := fmt.Sprintf("Search on internet and provide mitigation steps and fix recommendations for vulnerability %s affecting package %s version %s. Include official references if available.",
+		prompt := fmt.Sprintf(trivyPrompt,
 			vuln.VulnerabilityID, vuln.PkgName, vuln.PkgVersion)
 
 		analysis, err := requestAnalysis(ctx, client, prompt)
