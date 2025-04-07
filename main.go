@@ -19,7 +19,6 @@ import (
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
-	otelpyroscope "github.com/grafana/otel-profiling-go"
 	"github.com/grafana/pyroscope-go"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,9 +29,44 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+
+	_ "github.com/mattn/go-sqlite3"
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
+
+func initTracer(ctx context.Context) (*sdktrace.TracerProvider, *pyroscope.Profiler) {
+	if disableTracingProfiling {
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
+		otel.SetTracerProvider(tp)
+		return tp, nil
+	}
+	exporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint(tempoEndpoint),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		log.Fatalf("Tracer error: %v", err)
+	}
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String(appname),
+			semconv.ServiceVersionKey.String("1.2.0"),
+		)),
+	)
+	otel.SetTracerProvider(tp)
+	profiler, err := pyroscope.Start(pyroscope.Config{
+		ApplicationName: appname,
+		ServerAddress:   pyroscopeEndpoint,
+	})
+	if err != nil {
+		log.Fatalf("Pyroscope profiler error: %v", err)
+	}
+	return tp, profiler
+}
 
 const appname = "trivy-exporter"
 const trivyPrompt = "Provide mitigation steps and fix recommendations for vulnerability %s affecting package %s version %s. Include official references if available."
@@ -50,12 +84,12 @@ var (
 	logLevel          = getEnv("LOG_LEVEL", "info")
 	openAIAPIKey      = getEnv("OPENAI_API_KEY", "")
 	openAIModel       = getEnv("OPENAI_MODEL", "gpt-4-turbo")
-	enableTracing     = getEnv("ENABLE_TRACING", "false") == "true"
 	scanners          = "vuln"
 
-	db               *sql.DB
-	alertChannel     = make(chan Alert, 100) // Buffer size for pending alerts
-	alertsInProgress sync.Map                // Track CVEs being processed to avoid duplicates
+	disableTracingProfiling = strings.ToLower(getEnv("DISABLE_TRACING_PROFILING", "false")) == "true"
+	db                      *sql.DB
+	alertChannel            = make(chan Alert, 100) // Buffer size for pending alerts
+	alertsInProgress        sync.Map                // Track CVEs being processed to avoid duplicates
 	// Prometheus metrics
 	vulnMetric = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -131,48 +165,32 @@ func init() {
 
 }
 
-func main() {
-	rootCtx, cancel := context.WithCancel(context.Background())
+type noOpProfiler struct{}
 
-	if enableTracing {
-		ctx, span := otel.Tracer(appname).Start(rootCtx, "Main")
-		defer span.End()
-		defer waitForShutdown(cancel)
-		tp, profiler := initTracer(ctx)
-		defer func() { _ = profiler.Stop(); _ = tp.Shutdown(ctx) }()
-		run(rootCtx)
-	} else {
-		// No-op tracer
-		otel.SetTracerProvider(sdktrace.NewTracerProvider())
-		defer waitForShutdown(cancel)
-		run(rootCtx)
-	}
-}
+func (n *noOpProfiler) Stop() error { return nil }
 
 // main starts the program, spawning watchers, listeners, and the HTTP server
-func run(ctx context.Context) {
-	rootCtx, cancel := context.WithCancel(ctx)
-	ctx, span := otel.Tracer(appname).Start(rootCtx, "Run")
+func main() {
+	rootCtx, cancel := context.WithCancel(context.Background())
+	ctx, span := otel.Tracer(appname).Start(rootCtx, "Main")
 	defer span.End()
-
-	// Graceful shutdown handler
 	go waitForShutdown(cancel)
-
 	n, err := strconv.Atoi(numWorkers)
 	if err != nil {
 		n = 1
 	}
-
 	prometheus.MustRegister(vulnMetric, vulnTimestampMetric)
 	initDatabase(ctx)
 	defer db.Close()
-
 	tp, profiler := initTracer(ctx)
 	defer func() {
-		_ = profiler.Stop()
-		_ = tp.Shutdown(ctx)
+		if profiler != nil {
+			_ = profiler.Stop()
+		}
+		if tp != nil {
+			_ = tp.Shutdown(ctx)
+		}
 	}()
-
 	opts := []client.Opt{client.WithAPIVersionNegotiation()}
 	if dockerHost != "unix:///var/run/docker.sock" {
 		opts = append(opts, client.WithHost(dockerHost))
@@ -181,29 +199,21 @@ func run(ctx context.Context) {
 	if err != nil {
 		log.Fatalf("Docker client error: %v", err)
 	}
-
 	analysisQ := make(chan TrivyVulnerability, 10)
 	go cveAnalysisWorker(ctx, analysisQ)
-
 	scanQ := make(chan imageScanItem, n)
 	var wg sync.WaitGroup
-
 	for i := 0; i < n; i++ {
 		go worker(ctx, cli, scanQ, &wg, i, analysisQ)
 	}
-
 	go listenDockerEvents(ctx, cli, scanQ, &wg)
 	go processAlertBatches(ctx)
 	go updateMetrics(ctx)
-
 	http.Handle("/metrics", otelhttp.NewHandler(http.HandlerFunc(handleMetrics), "Metrics"))
 	http.Handle("/health", otelhttp.NewHandler(http.HandlerFunc(handleHealthCheck), "HealthCheck"))
 	http.Handle("/db/status", otelhttp.NewHandler(http.HandlerFunc(handleStatus), "Status"))
-
 	log.Infof("Listening on :8080, results stored in %s", resultsDir)
 	log.Fatal(http.ListenAndServe(":8080", nil))
-
-	// Wait all workers before exit
 	wg.Wait()
 	close(scanQ)
 }
@@ -699,39 +709,6 @@ func saveVulnerabilitiesToDatabase(ctx context.Context, report TrivyReport, anal
 			}
 		}
 	}
-}
-
-func initTracer(ctx context.Context) (*sdktrace.TracerProvider, *pyroscope.Profiler) {
-	exporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(tempoEndpoint),
-		otlptracegrpc.WithInsecure(),
-	)
-	if err != nil {
-		log.Fatalf("Tracer error: %v", err)
-	}
-
-	tpr := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName(appname),
-			semconv.ServiceVersion("1.2.0"),
-		)),
-	)
-
-	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(tpr))
-	profiler, err := pyroscope.Start(pyroscope.Config{
-		ApplicationName: appname,
-		ServerAddress:   pyroscopeEndpoint,
-		Tags: map[string]string{
-			"service_git_ref":    "main",
-			"service_repository": "https://github.com/cyrinux/trivy-exporter",
-		},
-	})
-	if err != nil {
-		log.Fatalf("Pyroscope profiler error: %v", err)
-	}
-	return tpr, profiler
 }
 
 func handleHealthCheck(w http.ResponseWriter, _ *http.Request) {

@@ -4,7 +4,6 @@ go 1.24.1
 
 require (
 	github.com/docker/docker v28.0.4+incompatible
-	github.com/grafana/otel-profiling-go v0.5.1
 	github.com/grafana/pyroscope-go v1.2.1
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/prometheus/client_golang v1.21.1
