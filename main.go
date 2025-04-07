@@ -73,23 +73,23 @@ const trivyPrompt = "Provide mitigation steps and fix recommendations for vulner
 
 // Environment variables
 var (
-	resultsDir        = getEnv("RESULTS_DIR", "/results")
-	dockerHost        = getEnv("DOCKER_HOST", "unix:///var/run/docker.sock")
-	trivyServerURL    = getEnv("TRIVY_SERVER_URL", "http://localhost:4954")
-	ntfyWebhookURL    = getEnv("NTFY_WEBHOOK_URL", "https://ntfy.sh/vulns")
-	tempoEndpoint     = getEnv("TEMPO_ENDPOINT", "localhost:4317") // change to http or grpc
-	pyroscopeEndpoint = getEnv("PYROSCOPE_ENDPOINT", "http://localhost:4040")
-	numWorkers        = getEnv("NUM_WORKERS", "1")
-	trivyExtraArgs    = getEnv("TRIVY_EXTRA_ARGS", "")
-	logLevel          = getEnv("LOG_LEVEL", "info")
-	openAIAPIKey      = getEnv("OPENAI_API_KEY", "")
-	openAIModel       = getEnv("OPENAI_MODEL", "gpt-4-turbo")
-	scanners          = "vuln"
-
+	resultsDir              = getEnv("RESULTS_DIR", "/results")
+	dockerHost              = getEnv("DOCKER_HOST", "unix:///var/run/docker.sock")
+	trivyServerURL          = getEnv("TRIVY_SERVER_URL", "http://localhost:4954")
+	ntfyWebhookURL          = getEnv("NTFY_WEBHOOK_URL", "https://ntfy.sh/vulns")
+	tempoEndpoint           = getEnv("TEMPO_ENDPOINT", "localhost:4317") // change to http or grpc
+	pyroscopeEndpoint       = getEnv("PYROSCOPE_ENDPOINT", "http://localhost:4040")
+	numWorkers              = getEnv("NUM_WORKERS", "1")
+	trivyExtraArgs          = getEnv("TRIVY_EXTRA_ARGS", "")
 	disableTracingProfiling = strings.ToLower(getEnv("DISABLE_TRACING_PROFILING", "false")) == "true"
-	db                      *sql.DB
-	alertChannel            = make(chan Alert, 100) // Buffer size for pending alerts
-	alertsInProgress        sync.Map                // Track CVEs being processed to avoid duplicates
+	logLevel                = getEnv("LOG_LEVEL", "info")
+	openAIAPIKey            = getEnv("OPENAI_API_KEY", "")
+	openAIModel             = getEnv("OPENAI_MODEL", "gpt-4-turbo")
+	scanners                = "vuln"
+
+	db               *sql.DB
+	alertChannel     = make(chan Alert, 100) // Buffer size for pending alerts
+	alertsInProgress sync.Map                // Track CVEs being processed to avoid duplicates
 	// Prometheus metrics
 	vulnMetric = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -392,6 +392,35 @@ func worker(ctx context.Context, cli *client.Client, scanQueue <-chan imageScanI
 	}
 }
 
+func alreadyScanned(ctx context.Context, image, checksum string) bool {
+	var (
+		dbChecksum sql.NullString
+		status     sql.NullString
+	)
+	err := db.QueryRowContext(ctx,
+		"SELECT checksum, status FROM image_scans WHERE image = ?",
+		image,
+	).Scan(&dbChecksum, &status)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false
+		}
+		log.Warnf("DB error in alreadyScanned for %s: %v", image, err)
+		return false
+	}
+
+	checksumVal := ""
+	if dbChecksum.Valid {
+		checksumVal = dbChecksum.String
+	}
+	statusVal := ""
+	if status.Valid {
+		statusVal = status.String
+	}
+
+	return (checksumVal == checksum && statusVal == "completed") || statusVal == "in_progress"
+}
+
 func getImageDigest(ctx context.Context, cli *client.Client, image string) string {
 	ctx, span := otel.Tracer(appname).Start(ctx, "GetImageDigest")
 	defer span.End()
@@ -403,23 +432,6 @@ func getImageDigest(ctx context.Context, cli *client.Client, image string) strin
 	}
 
 	return imgInspect.ID
-}
-
-func alreadyScanned(ctx context.Context, image, checksum string) bool {
-	ctx, span := otel.Tracer(appname).Start(ctx, "AlreadyScanned")
-	defer span.End()
-
-	var dbChecksum, status string
-	err := db.QueryRowContext(ctx, "SELECT checksum, status FROM image_scans WHERE image = ?", image).Scan(&dbChecksum, &status)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return false
-		}
-		log.Warnf("DB error in alreadyScanned for %s: %v", image, err)
-		return false
-	}
-
-	return (dbChecksum == checksum && status == "completed") || status == "in_progress"
 }
 
 func markImageScanInProgress(ctx context.Context, image string) {
