@@ -50,6 +50,7 @@ var (
 	logLevel          = getEnv("LOG_LEVEL", "info")
 	openAIAPIKey      = getEnv("OPENAI_API_KEY", "")
 	openAIModel       = getEnv("OPENAI_MODEL", "gpt-4-turbo")
+	enableTracing     = getEnv("ENABLE_TRACING", "false") == "true"
 	scanners          = "vuln"
 
 	db               *sql.DB
@@ -130,10 +131,28 @@ func init() {
 
 }
 
-// main starts the program, spawning watchers, listeners, and the HTTP server
 func main() {
 	rootCtx, cancel := context.WithCancel(context.Background())
-	ctx, span := otel.Tracer(appname).Start(rootCtx, "Main")
+
+	if enableTracing {
+		ctx, span := otel.Tracer(appname).Start(rootCtx, "Main")
+		defer span.End()
+		defer waitForShutdown(cancel)
+		tp, profiler := initTracer(ctx)
+		defer func() { _ = profiler.Stop(); _ = tp.Shutdown(ctx) }()
+		run(rootCtx)
+	} else {
+		// No-op tracer
+		otel.SetTracerProvider(sdktrace.NewTracerProvider())
+		defer waitForShutdown(cancel)
+		run(rootCtx)
+	}
+}
+
+// main starts the program, spawning watchers, listeners, and the HTTP server
+func run(ctx context.Context) {
+	rootCtx, cancel := context.WithCancel(ctx)
+	ctx, span := otel.Tracer(appname).Start(rootCtx, "Run")
 	defer span.End()
 
 	// Graceful shutdown handler
