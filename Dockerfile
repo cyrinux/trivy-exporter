@@ -15,7 +15,7 @@ COPY . .
 
 # Build the Go app
 # RUN go build -ldflags="-s -w" -o trivy-exporter .
-RUN go build -ldflags=" -w" -o trivy-exporter .
+RUN go build -ldflags=" -w" -o trivy-exporter ./cmd/trivy-exporter
 
 # Stage 2: Run the application
 FROM debian:bookworm-slim

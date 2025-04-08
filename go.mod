@@ -1,12 +1,12 @@
 module github.com/cyrinux/trivy-exporter
 
-go 1.24.1
+go 1.23.6
 
 require (
 	github.com/docker/docker v28.0.4+incompatible
 	github.com/grafana/pyroscope-go v1.2.1
-	github.com/mattn/go-sqlite3 v1.14.24
-	github.com/prometheus/client_golang v1.21.1
+	github.com/mattn/go-sqlite3 v1.14.27
+	github.com/prometheus/client_golang v1.22.0
 	github.com/sashabaranov/go-openai v1.38.1
 	github.com/sirupsen/logrus v1.9.3
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.60.0
@@ -16,7 +16,7 @@ require (
 )
 
 require (
-	github.com/Microsoft/go-winio v0.4.15-0.20190919025122-fc70bd9a86b5 // indirect
+	github.com/Microsoft/go-winio v0.4.14 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -31,7 +31,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grafana/pyroscope-go/godeltaprof v0.1.8 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.26.1 // indirect
-	github.com/klauspost/compress v1.17.11 // indirect
+	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/term v0.5.2 // indirect
 	github.com/morikuni/aec v1.0.0 // indirect
