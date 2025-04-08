@@ -12,10 +12,13 @@ RUN go mod download
 
 # Copy the source code into the container
 COPY . .
+COPY cmd/ .
+COPY internal/ .
+
 
 # Build the Go app
 # RUN go build -ldflags="-s -w" -o trivy-exporter .
-RUN go build -ldflags="-w" -o /app/trivy-exporter ./cmd/trivy-exporter
+RUN go build -ldflags="-w" -o trivy-exporter ./cmd/trivy-exporter
 
 # Stage 2: Run the application
 FROM debian:bookworm-slim
