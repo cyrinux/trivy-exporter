@@ -12,8 +12,8 @@ RUN go mod download
 
 # Copy the source code into the container
 COPY . .
-COPY cmd/ .
-COPY internal/ .
+COPY ./cmd/ .
+COPY ./internal/ .
 
 
 # Build the Go app
