@@ -14,6 +14,7 @@ RUN go mod download
 COPY . .
 COPY ./cmd/ .
 COPY ./internal/ .
+RUN ls --recursive .
 
 
 # Build the Go app
