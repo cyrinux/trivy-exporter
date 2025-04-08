@@ -11,7 +11,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy the source code into the container
-COPY ./cmd/. ./internal/. . /app/
+COPY . /app/
 
 
 # Build the Go app
