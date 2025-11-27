@@ -12,9 +12,7 @@ RUN go mod download
 
 # Copy the source code into the container
 COPY cmd/ ./cmd/
-COPY internal/ ./internal/
-COPY . .
-
+COPY ./internal ./internal/
 
 # Build the Go app
 # RUN go build -ldflags="-s -w" -o trivy-exporter .

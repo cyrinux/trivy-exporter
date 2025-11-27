@@ -17,17 +17,25 @@ func CVEAnalysisWorker(ctx context.Context, queue <-chan database.TrivyVulnerabi
 		return
 	}
 	cli := openai.NewClient(apiKey)
-	for vuln := range queue {
-		if cachedAnalysis(ctx, vuln.VulnerabilityID) {
-			continue
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case vuln, ok := <-queue:
+			if !ok {
+				return
+			}
+			if cachedAnalysis(ctx, vuln.VulnerabilityID) {
+				continue
+			}
+			p := fmt.Sprintf(trivyPrompt, vuln.VulnerabilityID, vuln.PkgName, vuln.PkgVersion)
+			resp, err := requestAnalysis(ctx, cli, p, model)
+			if err != nil {
+				continue
+			}
+			saveAnalysis(ctx, vuln.VulnerabilityID, resp)
+			alerts.SendAlert(ctx, vuln, resp)
 		}
-		p := fmt.Sprintf(trivyPrompt, vuln.VulnerabilityID, vuln.PkgName, vuln.PkgVersion)
-		resp, err := requestAnalysis(ctx, cli, p, model)
-		if err != nil {
-			continue
-		}
-		saveAnalysis(ctx, vuln.VulnerabilityID, resp)
-		alerts.SendAlert(ctx, vuln, resp)
 	}
 }
 

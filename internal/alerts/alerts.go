@@ -35,11 +35,19 @@ func ProcessAlertBatches(ctx context.Context, ntfyURL string) {
 	_, span := otel.Tracer("trivy-exporter").Start(ctx, "ProcessBatchAlerts")
 	defer span.End()
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		
 		var batch []database.Alert
 		size := 0
 		done := false
 		for size < 5 && !done {
 			select {
+			case <-ctx.Done():
+				return
 			case a := <-AlertChannel:
 				batch = append(batch, a)
 				size++
@@ -52,9 +60,17 @@ func ProcessAlertBatches(ctx context.Context, ntfyURL string) {
 			for _, a := range batch {
 				delete(AlertsInProgress, a.CVEID+":"+a.Image)
 			}
-			time.Sleep(10 * time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(10 * time.Second):
+			}
 		} else {
-			time.Sleep(1 * time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
+			}
 		}
 	}
 }

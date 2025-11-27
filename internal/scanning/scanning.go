@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -123,4 +124,11 @@ func requestTrivyScan(ctx context.Context, image, server, scanners, extra string
 	}
 	database.SaveVulnerabilitiesToDatabase(ctx, report, analysisQ)
 	return nil
+}
+
+func GetEnv(key, def string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
+	}
+	return def
 }
