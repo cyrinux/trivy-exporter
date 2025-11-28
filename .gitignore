@@ -1,1 +1,46 @@
+# Binaires compilés
 trivy-exporter
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Fichiers de test
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Dépendances
+vendor/
+
+# Résultats Trivy et cache
+/results/
+*.db
+*.db-shm
+*.db-wal
+
+# Fichiers d'environnement
+.env
+.env.local
+.env.*.local
+
+# IDE et éditeurs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Fichiers temporaires
+tmp/
+temp/
+.tmp/
+
+# Docker
+docker-compose.override.yml

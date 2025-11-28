@@ -1,0 +1,76 @@
+# Prometheus Configuration for Trivy Exporter
+# Place this file at the root and mount it in the Prometheus container
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'trivy-exporter'
+
+# Alerting (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#             - alertmanager:9093
+
+# Load alert rules (optional)
+# rule_files:
+#   - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # Job to scrape Trivy Exporter metrics
+  - job_name: 'trivy-exporter'
+    static_configs:
+      - targets: ['trivy-exporter:8080']
+    
+    # Increase timeout for long scans
+    scrape_timeout: 30s
+    
+    # Metrics to collect
+    metric_relabel_configs:
+      # Keep only trivy_* metrics
+      - source_labels: [__name__]
+        regex: 'trivy_.*'
+        action: keep
+
+  # Prometheus itself (monitoring the monitoring)
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+# Example alert rules (create rules/trivy-alerts.yml)
+# 
+# groups:
+#   - name: trivy_vulnerabilities
+#     interval: 1m
+#     rules:
+#       # Alert on new critical vulnerabilities
+#       - alert: CriticalVulnerabilityDetected
+#         expr: increase(trivy_vulnerability{severity="CRITICAL"}[5m]) > 0
+#         for: 1m
+#         labels:
+#           severity: critical
+#         annotations:
+#           summary: "New critical vulnerability detected"
+#           description: "Image {{ $labels.image }} has new critical vulnerability {{ $labels.id }}"
+#       
+#       # Alert on high vulnerability count per image
+#       - alert: HighVulnerabilityCount
+#         expr: sum by (image) (trivy_vulnerability) > 50
+#         for: 5m
+#         labels:
+#           severity: warning
+#         annotations:
+#           summary: "High vulnerability count"
+#           description: "Image {{ $labels.image }} contains {{ $value }} vulnerabilities"
+#       
+#       # Alert if no vulnerabilities are reported (service potentially down)
+#       - alert: NoVulnerabilityMetrics
+#         expr: absent(trivy_vulnerability)
+#         for: 10m
+#         labels:
+#           severity: warning
+#         annotations:
+#           summary: "No vulnerability metrics"
+#           description: "Trivy Exporter hasn't reported metrics for 10 minutes"

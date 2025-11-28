@@ -1,0 +1,7 @@
+# Trivy Ignore File
+# Use this file to ignore specific CVEs during scanning
+# Format: One CVE ID per line
+# Example:
+# CVE-2024-1234
+
+# Add CVE IDs below that you want to ignore:
