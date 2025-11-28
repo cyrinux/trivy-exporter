@@ -33,7 +33,11 @@ func ListenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<
 		select {
 		case <-ctx.Done():
 			return
-		case evt := <-evCh:
+		case evt, ok := <-evCh:
+			if !ok {
+				// Channel closed
+				return
+			}
 			if evt.Type == events.ContainerEventType {
 				info, e2 := cli.ContainerInspect(ctx, evt.Actor.ID)
 				if e2 != nil {
@@ -54,9 +58,13 @@ func ListenDockerEvents(ctx context.Context, cli *client.Client, scanQueue chan<
 					return
 				}
 			}
-		case e := <-errCh:
-			if e != nil {
-				continue
+		case err, ok := <-errCh:
+			if !ok {
+				// Channel closed
+				return
+			}
+			if err != nil {
+				log.Warnf("Docker events error: %v", err)
 			}
 		}
 	}
@@ -80,12 +88,17 @@ func Worker(ctx context.Context, cli *client.Client, scanQueue <-chan ImageScanI
 				}
 				digest := getImageDigest(ctx, cli, item.Image)
 				if database.AlreadyScanned(ctx, item.Image, digest) {
+					log.Debugf("Image %s already scanned (digest: %s), skipping", item.Image, digest)
 					return
 				}
+				log.Infof("Starting scan for image: %s (digest: %s)", item.Image, digest)
 				database.MarkImageScanInProgress(ctx, item.Image)
 				if err := requestTrivyScan(ctx, item.Image, serverURL, item.Scanners, trivyExtraArgs, analysisQ); err != nil {
 					log.Warnf("Trivy scan error for %s: %v", item.Image, err)
+					// Mark scan as failed to allow retry later
+					database.SaveImageChecksum(ctx, item.Image, "")
 				} else {
+					log.Infof("Scan completed successfully for image: %s", item.Image)
 					database.SaveImageChecksum(ctx, item.Image, digest)
 				}
 			}()

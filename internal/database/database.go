@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -153,13 +154,8 @@ func firstPart(artifact string) string {
 }
 
 func splitFirst(s, sep string) string {
-	idx := -1
-	for i := range s {
-		if string(s[i]) == sep {
-			idx = i
-			break
-		}
-	}
+	// Use strings.Index for better performance
+	idx := strings.Index(s, sep)
 	if idx == -1 {
 		return s
 	}
@@ -168,19 +164,32 @@ func splitFirst(s, sep string) string {
 
 func AlreadyScanned(ctx context.Context, image, checksum string) bool {
 	var dbChecksum, status sql.NullString
-	err := DB.QueryRowContext(ctx, "SELECT checksum, status FROM image_scans WHERE image = ?", image).Scan(&dbChecksum, &status)
+	var timestamp sql.NullInt64
+	err := DB.QueryRowContext(ctx, "SELECT checksum, status, timestamp FROM image_scans WHERE image = ?", image).Scan(&dbChecksum, &status, &timestamp)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return false
 		}
 		return false
 	}
+	
+	// If scan completed with same checksum, skip
 	if dbChecksum.Valid && dbChecksum.String == checksum && status.Valid && status.String == "completed" {
 		return true
 	}
+	
+	// If scan in progress, check if it's stale (more than 15 minutes old)
 	if status.Valid && status.String == "in_progress" {
+		if timestamp.Valid {
+			scanAge := time.Now().Unix() - timestamp.Int64
+			if scanAge > 900 { // 15 minutes
+				log.Warnf("Scan for %s is stale (age: %d seconds), allowing rescan", image, scanAge)
+				return false
+			}
+		}
 		return true
 	}
+	
 	return false
 }
 
