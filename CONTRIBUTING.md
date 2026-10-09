@@ -30,7 +30,7 @@ There are several ways to contribute:
 
 ### Prerequisites
 
-- Go 1.23.6 or higher
+- Go 1.26 or higher
 - Docker and Docker Compose
 - Git
 - Make (optional but recommended)

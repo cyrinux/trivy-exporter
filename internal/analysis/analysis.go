@@ -1,22 +1,30 @@
+// Package analysis asks an OpenAI model for mitigation advice on newly
+// discovered vulnerabilities and forwards the result as an alert.
 package analysis
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"time"
 
 	"github.com/cyrinux/trivy-exporter/internal/alerts"
 	"github.com/cyrinux/trivy-exporter/internal/database"
 	openai "github.com/sashabaranov/go-openai"
+	log "github.com/sirupsen/logrus"
 )
 
 const trivyPrompt = "Provide mitigation steps and fix recommendations for vulnerability %s affecting package %s version %s. Include official references if available."
 
+// CVEAnalysisWorker consumes vulnerabilities from queue. With an API key it
+// requests an analysis (cached per CVE) before alerting; without one it
+// alerts directly.
 func CVEAnalysisWorker(ctx context.Context, queue <-chan database.TrivyVulnerability, apiKey, model string) {
-	if apiKey == "" {
-		return
+	var cli *openai.Client
+	if apiKey != "" {
+		cli = openai.NewClient(apiKey)
+	} else {
+		log.Info("OPENAI_API_KEY not set, CVE analysis disabled")
 	}
-	cli := openai.NewClient(apiKey)
 	for {
 		select {
 		case <-ctx.Done():
@@ -25,18 +33,30 @@ func CVEAnalysisWorker(ctx context.Context, queue <-chan database.TrivyVulnerabi
 			if !ok {
 				return
 			}
-			if cachedAnalysis(ctx, vuln.VulnerabilityID) {
-				continue
-			}
-			p := fmt.Sprintf(trivyPrompt, vuln.VulnerabilityID, vuln.PkgName, vuln.PkgVersion)
-			resp, err := requestAnalysis(ctx, cli, p, model)
-			if err != nil {
-				continue
-			}
-			saveAnalysis(ctx, vuln.VulnerabilityID, resp)
-			alerts.SendAlert(ctx, vuln, resp)
+			handle(ctx, cli, model, vuln)
 		}
 	}
+}
+
+func handle(ctx context.Context, cli *openai.Client, model string, vuln database.TrivyVulnerability) {
+	if cli == nil {
+		alerts.SendAlert(vuln, "")
+		return
+	}
+	if database.HasAnalysis(ctx, vuln.VulnerabilityID) {
+		return
+	}
+	prompt := fmt.Sprintf(trivyPrompt, vuln.VulnerabilityID, vuln.PkgName, vuln.PkgVersion)
+	resp, err := requestAnalysis(ctx, cli, prompt, model)
+	if err != nil {
+		log.Warnf("analysis of %s failed: %v", vuln.VulnerabilityID, err)
+		alerts.SendAlert(vuln, "")
+		return
+	}
+	if err := database.SaveAnalysis(ctx, vuln.VulnerabilityID, resp); err != nil {
+		log.Warnf("saving analysis of %s failed: %v", vuln.VulnerabilityID, err)
+	}
+	alerts.SendAlert(vuln, resp)
 }
 
 func requestAnalysis(ctx context.Context, c *openai.Client, prompt, model string) (string, error) {
@@ -49,19 +69,8 @@ func requestAnalysis(ctx context.Context, c *openai.Client, prompt, model string
 	if err != nil {
 		return "", err
 	}
-	return r.Choices[0].Message.Content, nil
-}
-
-func cachedAnalysis(ctx context.Context, vulnID string) bool {
-	var exists bool
-	err := database.DB.QueryRowContext(ctx, "SELECT EXISTS(SELECT vulnerability_id FROM cve_analysis WHERE vulnerability_id=?)", vulnID).Scan(&exists)
-	if err != nil {
-		return false
+	if len(r.Choices) == 0 {
+		return "", errors.New("empty completion")
 	}
-	return exists
-}
-
-func saveAnalysis(ctx context.Context, vulnID, analysis string) {
-	_, _ = database.DB.ExecContext(ctx, "INSERT INTO cve_analysis (vulnerability_id, analysis, analyzed_at) VALUES (?, ?, ?)",
-		vulnID, analysis, time.Now().UTC())
+	return r.Choices[0].Message.Content, nil
 }

@@ -1,10 +1,12 @@
+// Package tracer wires OpenTelemetry tracing (OTLP/gRPC) and Pyroscope
+// continuous profiling.
 package tracer
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/grafana/pyroscope-go"
-	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -12,22 +14,24 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
-func InitTracer(ctx context.Context, appname, tempoEndpoint, pyroEndpoint string, disable bool) (*sdktrace.TracerProvider, *pyroscope.Profiler) {
+// InitTracer sets the global tracer provider and starts the profiler.
+// When disable is true a no-op provider is installed and no profiler runs.
+func InitTracer(ctx context.Context, appname, version, tempoEndpoint, pyroEndpoint string, disable bool) (*sdktrace.TracerProvider, *pyroscope.Profiler, error) {
 	if disable {
 		tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
 		otel.SetTracerProvider(tp)
-		return tp, nil
+		return tp, nil, nil
 	}
 	exp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint(tempoEndpoint), otlptracegrpc.WithInsecure())
 	if err != nil {
-		log.Fatalf("Tracer error: %v", err)
+		return nil, nil, fmt.Errorf("otlp exporter: %w", err)
 	}
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String(appname),
-			semconv.ServiceVersionKey.String("1.2.0"),
+			semconv.ServiceVersionKey.String(version),
 		)),
 	)
 	otel.SetTracerProvider(tp)
@@ -36,7 +40,8 @@ func InitTracer(ctx context.Context, appname, tempoEndpoint, pyroEndpoint string
 		ServerAddress:   pyroEndpoint,
 	})
 	if err != nil {
-		log.Fatalf("Pyroscope profiler error: %v", err)
+		_ = tp.Shutdown(ctx)
+		return nil, nil, fmt.Errorf("pyroscope: %w", err)
 	}
-	return tp, p
+	return tp, p, nil
 }

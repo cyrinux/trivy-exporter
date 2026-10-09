@@ -1,59 +1,13 @@
-# Git
 .git
-.gitignore
 .github
-
-# Documentation
+.serena
 *.md
-LICENSE
-
-# Build artifacts
+!README.md
+docker-compose.yml
+prometheus.yml
+.env*
 trivy-exporter
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-
-# Test files
-*_test.go
-*.test
-*.out
-coverage.txt
-coverage.html
-
-# Development files
-.env
-.env.*
-.vscode
-.idea
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Results and cache
+coverage.*
 results/
 *.db
-*.db-shm
-*.db-wal
-
-# Docker
-docker-compose*.yml
-Dockerfile
-.dockerignore
-
-# Config examples
-*.example
-prometheus.yml
-
-# Temporary files
-tmp/
-temp/
-.tmp/
-
-# Logs
-*.log
-
-# Dependencies (we'll download them in the build)
-vendor/
+*.db-*

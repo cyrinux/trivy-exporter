@@ -1,9 +1,7 @@
-version: '3.8'
-
 services:
-  # Main Trivy Exporter service
   trivy-exporter:
     image: ghcr.io/cyrinux/trivy-exporter:latest
+    build: .
     container_name: trivy-exporter
     restart: unless-stopped
     ports:
@@ -16,103 +14,67 @@ services:
       # SQLite database storage
       - trivy-results:/results
     environment:
-      # Basic configuration
-      - LOG_LEVEL=info
-      - NUM_WORKERS=2
-      
-      # OpenAI for CVE analysis (optional)
-      # Uncomment and set your API key
-      # - OPENAI_API_KEY=${OPENAI_API_KEY}
-      # - OPENAI_MODEL=gpt-4-turbo
-      
-      # ntfy.sh alerts (optional)
-      # - NTFY_WEBHOOK_URL=https://ntfy.sh/your-topic
-      
+      LOG_LEVEL: info
+      NUM_WORKERS: "2"
+      # Rescan every running container's image every 6 hours (0 disables)
+      SCAN_INTERVAL_MINUTES: "360"
       # Custom Trivy arguments
-      - TRIVY_EXTRA_ARGS=--ignore-unfixed --severity HIGH,CRITICAL
-      
-      # Disable tracing/profiling if not used
-      - DISABLE_TRACING_PROFILING=true
-    
+      TRIVY_EXTRA_ARGS: --ignore-unfixed --severity HIGH,CRITICAL
+      # Use a Trivy server instead of the embedded CLI database (optional)
+      # TRIVY_SERVER_URL: http://trivy-server:4954
+      # OpenAI for CVE analysis (optional)
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # OPENAI_MODEL: gpt-4o-mini
+      # ntfy.sh alerts (optional)
+      # NTFY_WEBHOOK_URL: https://ntfy.sh/your-topic
+      # Tracing/profiling are off by default; point them at your stack to enable
+      DISABLE_TRACING_PROFILING: "true"
+      # TEMPO_ENDPOINT: tempo:4317
+      # PYROSCOPE_ENDPOINT: http://pyroscope:4040
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-    
-    # Resource limits (adjust according to your needs)
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: "2"
           memory: 1G
         reservations:
-          cpus: '0.5'
+          cpus: "0.5"
           memory: 256M
 
-  # Example: Complete stack with Prometheus and Grafana (optional)
-  # Uncomment for full observability
+  # Optional: Trivy server so workers share one vulnerability database.
+  # Pin the image to a digest; Trivy's release channels were compromised in 2026.
+  # trivy-server:
+  #   image: ghcr.io/aquasecurity/trivy:0.75.0
+  #   command: ["server", "--listen", "0.0.0.0:4954"]
+  #   volumes:
+  #     - trivy-server-cache:/root/.cache/trivy
 
+  # Optional observability stack
   # prometheus:
   #   image: prom/prometheus:latest
-  #   container_name: prometheus
-  #   restart: unless-stopped
-  #   ports:
-  #     - "9090:9090"
+  #   ports: ["9090:9090"]
   #   volumes:
   #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
   #     - prometheus-data:/prometheus
-  #   command:
-  #     - '--config.file=/etc/prometheus/prometheus.yml'
-  #     - '--storage.tsdb.path=/prometheus'
-  #     - '--storage.tsdb.retention.time=30d'
-
   # grafana:
   #   image: grafana/grafana:latest
-  #   container_name: grafana
-  #   restart: unless-stopped
-  #   ports:
-  #     - "3000:3000"
-  #   volumes:
-  #     - grafana-data:/var/lib/grafana
-  #   environment:
-  #     - GF_SECURITY_ADMIN_PASSWORD=admin
-  #     - GF_INSTALL_PLUGINS=
-
+  #   ports: ["3000:3000"]
+  #   volumes: ["grafana-data:/var/lib/grafana"]
   # tempo:
   #   image: grafana/tempo:latest
-  #   container_name: tempo
-  #   restart: unless-stopped
-  #   ports:
-  #     - "4317:4317"  # OTLP gRPC
-  #     - "3200:3200"  # Tempo HTTP
-  #   volumes:
-  #     - tempo-data:/var/tempo
-
+  #   ports: ["4317:4317", "3200:3200"]
   # pyroscope:
   #   image: grafana/pyroscope:latest
-  #   container_name: pyroscope
-  #   restart: unless-stopped
-  #   ports:
-  #     - "4040:4040"
-  #   volumes:
-  #     - pyroscope-data:/var/lib/pyroscope
+  #   ports: ["4040:4040"]
 
 volumes:
   trivy-cache:
-    driver: local
   trivy-results:
-    driver: local
+  # trivy-server-cache:
   # prometheus-data:
-  #   driver: local
   # grafana-data:
-  #   driver: local
-  # tempo-data:
-  #   driver: local
-  # pyroscope-data:
-  #   driver: local
-
-networks:
-  default:
-    name: trivy-exporter-network

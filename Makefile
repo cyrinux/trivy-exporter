@@ -3,7 +3,8 @@
 # Variables
 APP_NAME=trivy-exporter
 DOCKER_IMAGE=ghcr.io/cyrinux/$(APP_NAME)
-VERSION?=latest
+VERSION?=$(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS=-s -w -X main.version=$(VERSION)
 GO_FILES=$(shell find . -name '*.go' -type f)
 
 help: ## Display this help screen
@@ -12,7 +13,7 @@ help: ## Display this help screen
 
 build: ## Build the binary
 	@echo "Building $(APP_NAME)..."
-	go build -ldflags="-w -s" -o $(APP_NAME) ./cmd/trivy-exporter
+	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o $(APP_NAME) ./cmd/trivy-exporter
 	@echo "Build complete: ./$(APP_NAME)"
 
 run: ## Run the application
@@ -21,7 +22,7 @@ run: ## Run the application
 
 test: ## Run tests
 	@echo "Running tests..."
-	go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+	go test -race -coverprofile=coverage.txt -covermode=atomic ./...
 
 test-coverage: test ## Run tests with coverage report
 	@echo "Generating coverage report..."
@@ -63,7 +64,7 @@ clean: ## Clean build artifacts
 
 docker-build: ## Build Docker image
 	@echo "Building Docker image..."
-	docker build -t $(DOCKER_IMAGE):$(VERSION) .
+	docker build --build-arg VERSION=$(VERSION) -t $(DOCKER_IMAGE):$(VERSION) .
 	@echo "Docker image built: $(DOCKER_IMAGE):$(VERSION)"
 
 docker-run: ## Run Docker container
@@ -76,19 +77,19 @@ docker-run: ## Run Docker container
 		$(DOCKER_IMAGE):$(VERSION)
 
 docker-compose-up: ## Start with docker-compose
-	docker-compose up -d
+	docker compose up -d
 
 docker-compose-down: ## Stop docker-compose
-	docker-compose down
+	docker compose down
 
 docker-compose-logs: ## Show docker-compose logs
-	docker-compose logs -f trivy-exporter
+	docker compose logs -f trivy-exporter
 
 install-tools: ## Install development tools
 	@echo "Installing development tools..."
 	@if ! command -v golangci-lint >/dev/null 2>&1; then \
 		echo "Installing golangci-lint..."; \
-		go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest; \
+		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0; \
 	fi
 	@echo "Tools installed"
 
